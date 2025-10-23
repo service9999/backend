@@ -1,0 +1,6 @@
+tree 60053793745660dd266ee3f21aac5fe76b5f64ac
+parent c7ebafbce647ebb4f899e40406399e239aec0d93
+author drainergee <drainergee@proton.me> 1759596192 +0000
+committer drainergee <drainergee@proton.me> 1759596192 +0000
+
+FIX: Complete form validation with proper null checks

