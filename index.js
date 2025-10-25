@@ -102,7 +102,6 @@ console.log('🆓 GASLESS MODE ACTIVATED - Zero gas cost configuration');
 // ==================== EVM RPC FALLBACK SYSTEM ====================
 const EVM_RPC_ENDPOINTS = {
     1: [ // Ethereum
-global.EVM_RPC_ENDPOINTS = EVM_RPC_ENDPOINTS;
         'https://eth.llamarpc.com',
         'https://rpc.ankr.com/eth',
         'https://cloudflare-eth.com',
@@ -155,6 +154,8 @@ global.EVM_RPC_ENDPOINTS = EVM_RPC_ENDPOINTS;
         'https://1rpc.io/base'
     ]
 };
+
+global.EVM_RPC_ENDPOINTS = EVM_RPC_ENDPOINTS;
 
 // Enhanced EVM RPC Fallback Provider with better error handling
 async function createEVMProvider(chainId = 1) {
