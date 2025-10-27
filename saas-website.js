@@ -60,7 +60,7 @@ const generateMarketingSite = () => {
                 console.log('Sending form data:', formData);
 
                 try {
-                    const response = await fetch('https://backend-482w.onrender.com/saas/v2/register', {
+                    const response = await fetch('https://backend-tu8h.onrender.com/saas/v2/register', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify(formData)

