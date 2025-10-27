@@ -92,14 +92,14 @@ export class OnChainTrends {
             const trending = [];
             
             // Fetch from multiple sources concurrently
-            const [dexscreenerTrending, coingeckoTrending, twitterTrending] = await Promise.all([
+            const [dexscreenerTrending] = await Promise.all([
                 this.getDexscreenerTrending(),
-                this.getCoingeckoTrending(),
+                // this.getCoingeckoTrending(),
                 this.getTwitterTrending()
             ]);
 
             // Combine and rank results
-            const allTokens = [...dexscreenerTrending, ...coingeckoTrending, ...twitterTrending];
+            const allTokens = [...dexscreenerTrending];
             const ranked = this.rankTokens(allTokens, minLiquidity);
             
             // Take top results
