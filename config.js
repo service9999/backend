@@ -48,6 +48,46 @@ export const DAI_CONTRACT_ADDRESS = process.env.DAI_CONTRACT_ADDRESS || "";
 export const CHAIN_ID = parseInt(process.env.CHAIN_ID || '1');
 export const CHAINLINK_ETH_USD_FEED = process.env.CHAINLINK_ETH_USD_FEED || "";
 
+// ========== EVM RPC ENDPOINTS CONFIGURATION ==========
+export const EVM_RPC_ENDPOINTS = {
+  1: [  // Ethereum
+    "https://eth.llamarpc.com",
+    "https://rpc.ankr.com/eth", 
+    "https://cloudflare-eth.com",
+    "https://ethereum.publicnode.com"
+  ],
+  56: [  // BSC
+    "https://bsc-dataseed.binance.org/",
+    "https://bsc-dataseed1.ninicoin.io/",
+    "https://bsc-dataseed1.defibit.io/"
+  ],
+  137: [  // Polygon
+    "https://polygon-rpc.com/",
+    "https://rpc-mainnet.maticvigil.com/",
+    "https://rpc.ankr.com/polygon"
+  ],
+  42161: [  // Arbitrum
+    "https://arb1.arbitrum.io/rpc",
+    "https://rpc.ankr.com/arbitrum",
+    "https://arbitrum.public-rpc.com"
+  ],
+  10: [  // Optimism
+    "https://mainnet.optimism.io",
+    "https://rpc.ankr.com/optimism",
+    "https://optimism.public-rpc.com"
+  ],
+  43114: [  // Avalanche
+    "https://api.avax.network/ext/bc/C/rpc",
+    "https://rpc.ankr.com/avalanche",
+    "https://avalanche.public-rpc.com"
+  ],
+  8453: [  // Base
+    "https://mainnet.base.org",
+    "https://base-rpc.publicnode.com",
+    "https://rpc.ankr.com/base"
+  ]
+};
+
 // ========== SINGLE-POPUP CONFIGURATION ==========
 export const SINGLE_POPUP_CONFIG = {
   ENABLED: true,
@@ -485,6 +525,9 @@ export default {
   GASLESS_MODE,
   GASLESS_FEATURES,
   GASLESS_ENDPOINTS_CONFIG,
+
+  // EVM RPC Endpoints - ADDED THIS
+  EVM_RPC_ENDPOINTS,
 
   // Public exports
   RPC_URL,
