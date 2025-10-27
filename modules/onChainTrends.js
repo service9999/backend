@@ -135,7 +135,7 @@ export class OnChainTrends {
     async getDexscreenerTrending() {
         try {
             const url = `${this.dexConfig.baseUrl}${this.dexConfig.endpoints.pairs}`;
-            const response = await fetch(url);
+            const url = "https://api.dexscreener.com/latest/dex/tokens/trending";
             
             if (!response.ok) {
                 throw new Error(`DexScreener API error: ${response.status}`);
@@ -153,7 +153,7 @@ export class OnChainTrends {
     // Get trending from CoinGecko
     async getCoingeckoTrending() {
         try {
-            const url = `${this.coingeckoConfig.baseUrl}${this.coingeckoConfig.endpoints.trending}`;
+            const url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd            const url = `${this.coingeckoConfig.baseUrl}${this.coingeckoConfig.endpoints.trending}`;order=volume_desc            const url = `${this.coingeckoConfig.baseUrl}${this.coingeckoConfig.endpoints.trending}`;per_page=20            const url = `${this.coingeckoConfig.baseUrl}${this.coingeckoConfig.endpoints.trending}`;page=1";
             const response = await fetch(url);
             
             if (!response.ok) {
