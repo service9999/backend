@@ -69,16 +69,6 @@ export class OnChainTrends {
             console.log('📈 Initializing On-Chain Trends...');
             
             // Check API keys
-            if (!this.dexscreenerApiKey) {
-                console.warn('⚠️ DexScreener API key not configured');
-            }
-            if (!this.coingeckoApiKey) {
-                console.warn('⚠️ CoinGecko API key not configured');
-            }
-            if (!this.twitterBearerToken) {
-                console.warn('⚠️ Twitter Bearer Token not configured');
-            }
-            
             // Start background updates
             this.startTrendingUpdates();
             this.startPriceUpdates();
