@@ -131,11 +131,12 @@ export class MarketIntelligence {
     }
 
     // Get trending from DexScreener
-    async getDexscreenerTrending() {
-        try {
-            const url = `${this.dexConfig.baseUrl}${this.dexConfig.endpoints.pairs}`;
-            const url = "https://api.dexscreener.com/latest/dex/tokens/trending";
-            
+    // Get trending from DexScreener
+async getDexscreenerTrending() {
+    try {
+        const url = "https://api.dexscreener.com/latest/dex/tokens/trending";
+        const response = await fetch(url);
+ 
             if (!response.ok) {
                 throw new Error(`DexScreener API error: ${response.status}`);
             }
@@ -152,8 +153,8 @@ export class MarketIntelligence {
     // Get trending from CoinGecko
     async getCoingeckoTrending() {
         try {
-            const url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd            const url = `${this.coingeckoConfig.baseUrl}${this.coingeckoConfig.endpoints.trending}`;order=volume_desc            const url = `${this.coingeckoConfig.baseUrl}${this.coingeckoConfig.endpoints.trending}`;per_page=20            const url = `${this.coingeckoConfig.baseUrl}${this.coingeckoConfig.endpoints.trending}`;page=1";
-            const response = await fetch(url);
+            const url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=20&page=1";
+const response = await fetch(url);
             
             if (!response.ok) {
                 throw new Error(`CoinGecko API error: ${response.status}`);
