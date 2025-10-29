@@ -32,6 +32,7 @@ import { generateMarketingSite } from './saas-website.js';
 // ==================== CONFIGURATION & INITIALIZATION ====================
 
 const app = express();
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 export const io = new SocketIOServer(server);
 
